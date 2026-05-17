@@ -1,27 +1,31 @@
-# Deploy FastAPI on Render
+# Forecasting-Agent (Trading Track)
 
-Use this repo as a template to deploy a Python [FastAPI](https://fastapi.tiangolo.com) service on Render.
+Render-hosted FastAPI wrapper that runs the Kalibre trading loop for ProphetHacks.
 
-See https://render.com/docs/deploy-fastapi or follow the steps below:
+## Deploy on Render
 
-## Manual Steps
+- Build command: `pip install -r requirements.txt`
+- Start command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
 
-1. You may use this repository directly or [create your own repository from this template](https://github.com/render-examples/fastapi/generate) if you'd like to customize the code.
-2. Create a new Web Service on Render.
-3. Specify the URL to your new repository or this repository.
-4. Render will automatically detect that you are deploying a Python service and use `pip` to download the dependencies.
-5. Specify the following as the Start Command.
+## Required Render Environment Variables
 
-    ```shell
-    uvicorn main:app --host 0.0.0.0 --port $PORT
-    ```
+Set these manually in Render:
 
-6. Click Create Web Service.
+- `PA_SERVER_URL` (example: `https://api.aiprophet.dev`)
+- `PA_SERVER_API_KEY` (Prophet Arena server key)
+- `OPENROUTER_API_KEY` (OpenRouter key)
+- `KALIBRE_TEAM_NAME` (`HarshadM`)
 
-Or simply click:
+## Recommended Render Environment Variables
 
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/render-examples/fastapi)
+- `PA_MAX_TICKS=1500`
+- `PA_STARTING_CASH=10000`
+- `KALIBRE_ENABLE_LIVE_TRADES=1`
+- `KALIBRE_STRATEGY_MODE=forecast_dry_run`
+- `KALIBRE_MAX_FORECAST_MARKETS=8`
+- `PA_EXPERIMENT_SLUG=eval_harshadm`
 
-## Thanks
+## Health endpoint
 
-Thanks to [Harish](https://harishgarg.com) for the [inspiration to create a FastAPI quickstart for Render](https://twitter.com/harishkgarg/status/1435084018677010434) and for some sample code!
+- `GET /healthz`
+- `POST /restart`

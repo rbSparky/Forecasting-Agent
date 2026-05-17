@@ -1,0 +1,104 @@
+# Phase 3 forecast configuration (committed; no secrets).
+#
+# Edit this file to add new models or update pricing. The loader in
+# kalibre/forecast/config.py reads it at import time but tests can pass
+# a different path via load_forecast_config(path=...).
+#
+# Keys live in environment variables only; this file holds non-secret
+# constants.
+
+default_model = "openrouter:anthropic/claude-sonnet-4.6"
+
+[tokens]
+est_input = 800
+est_output = 300
+
+[fallback]
+# Used when a model id is not present in [pricing.*]. USD per million tokens.
+input_per_mtok = 3.0
+output_per_mtok = 15.0
+
+# Tier sigma values implement AGENTS.md A.3 (clipped into [0.02, 0.25]
+# by kalibre.sizing.clip_sigma_p).
+[tier_sigma]
+opus = 0.05
+sonnet = 0.08
+haiku = 0.12
+structural_only = 0.15
+external = 0.15
+default = 0.15
+
+# Per-million-token USD rates ((input, output)). Anthropic + OpenAI common ids.
+[pricing."anthropic/claude-sonnet-4.6"]
+input_per_mtok = 3.0
+output_per_mtok = 15.0
+
+[pricing."anthropic/claude-sonnet-4.5"]
+input_per_mtok = 3.0
+output_per_mtok = 15.0
+
+[pricing."anthropic/claude-sonnet-4"]
+input_per_mtok = 3.0
+output_per_mtok = 15.0
+
+[pricing."anthropic/claude-opus-4.7"]
+input_per_mtok = 5.0
+output_per_mtok = 25.0
+
+[pricing."anthropic/claude-opus-4.6"]
+input_per_mtok = 5.0
+output_per_mtok = 25.0
+
+[pricing."anthropic/claude-opus-4.5"]
+input_per_mtok = 5.0
+output_per_mtok = 25.0
+
+[pricing."anthropic/claude-haiku-4.5"]
+input_per_mtok = 1.0
+output_per_mtok = 5.0
+
+[pricing."anthropic/claude-3.5-haiku"]
+input_per_mtok = 1.0
+output_per_mtok = 5.0
+
+[pricing."openai/gpt-4o-mini"]
+input_per_mtok = 0.15
+output_per_mtok = 0.60
+
+[pricing."openai/gpt-4o"]
+input_per_mtok = 2.50
+output_per_mtok = 10.00
+
+# --- Phase 4A cheap-alpha layers (shadow-only by default) ------------------
+# Knobs for the quote-history modifier (A.11) and the longshot prior (A.6).
+# All weights default to 0.0 so behavior is identical to Phase 3B until an
+# operator explicitly ramps them in. The longshot prior is logged for
+# every eligible/blocked candidate but never becomes the primary
+# probability unless [layers.longshot].primary_enabled is true.
+
+[layers.quote_history]
+enabled = true
+confidence_modifier_weight = 0.0
+deference_signal_weight = 0.0
+exit_signal_weight = 0.0
+
+[layers.longshot]
+enabled = true
+primary_enabled = false
+max_time_to_resolve_days = 7
+max_open_longshots = 5
+stop_loss_window = 20
+stop_loss_win_rate_threshold = 0.40
+stop_loss_suspension_hours = 24.0
+
+# Category alphas from A.6 (Day-0 priors). Default 1.0 -> no adjustment.
+[layers.longshot.alpha]
+sports = 0.70
+politics = 0.85
+crypto = 0.90
+prices = 0.90
+entertainment = 0.95
+economics = 0.95
+science = 0.95
+other = 1.00
+default = 1.00
