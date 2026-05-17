@@ -275,6 +275,56 @@ CREATE TABLE IF NOT EXISTS schema_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- Phase 6B: OpenRouter web-search auditing. The model decides when to
+-- search; the response carries usage.server_tool_use.web_search_requests
+-- plus url_citation annotations. We persist one row per cited URL into
+-- web_search_results and one row per forecast bundle into
+-- evidence_bundles. ``web_search_queries`` is a per-forecast aggregate
+-- (we don't see the individual queries from OpenRouter).
+CREATE TABLE IF NOT EXISTS web_search_queries (
+    query_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tick_ts TEXT NOT NULL,
+    experiment_id TEXT NOT NULL,
+    market_id TEXT NOT NULL,
+    engine TEXT,
+    requests_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_wsq_tick ON web_search_queries(tick_ts);
+CREATE INDEX IF NOT EXISTS idx_wsq_market ON web_search_queries(market_id, tick_ts);
+
+CREATE TABLE IF NOT EXISTS web_search_results (
+    result_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tick_ts TEXT NOT NULL,
+    experiment_id TEXT NOT NULL,
+    market_id TEXT NOT NULL,
+    url TEXT NOT NULL,
+    domain TEXT,
+    source_tier TEXT,
+    title TEXT,
+    snippet TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_wsr_tick ON web_search_results(tick_ts);
+CREATE INDEX IF NOT EXISTS idx_wsr_market ON web_search_results(market_id, tick_ts);
+CREATE INDEX IF NOT EXISTS idx_wsr_domain ON web_search_results(domain);
+
+CREATE TABLE IF NOT EXISTS evidence_bundles (
+    bundle_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tick_ts TEXT NOT NULL,
+    experiment_id TEXT NOT NULL,
+    market_id TEXT NOT NULL,
+    evidence_hash TEXT,
+    urls_json TEXT,
+    evidence_quality REAL,
+    stale_evidence INTEGER,
+    key_drivers_json TEXT,
+    web_search_requests INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_eb_tick ON evidence_bundles(tick_ts);
+CREATE INDEX IF NOT EXISTS idx_eb_market ON evidence_bundles(market_id, tick_ts);
 """
 
 
@@ -606,6 +656,59 @@ class StateStore:
         conn.executemany(
             f"INSERT OR REPLACE INTO proposals({', '.join(cols)}) VALUES ({placeholders})",
             [tuple(r[c] for c in cols) for r in materialized],
+        )
+
+    # --- Phase 6B: web-search audit writers ----------------------------
+
+    def record_web_search_results(self, rows: Iterable[dict[str, Any]]) -> None:
+        """Persist one row per cited URL into ``web_search_results``.
+
+        Each row dict carries: ``tick_ts``, ``experiment_id``, ``market_id``,
+        ``url``, ``domain``, ``source_tier``, optional ``title``/``snippet``,
+        and ``created_at``. Unknown columns are tolerated -- the writer
+        materializes ``INSERT`` from whichever subset is present.
+        """
+        materialized = list(rows)
+        if not materialized:
+            return
+        conn = self.connect()
+        cols = list(materialized[0].keys())
+        placeholders = ", ".join("?" * len(cols))
+        conn.executemany(
+            f"INSERT INTO web_search_results({', '.join(cols)}) VALUES ({placeholders})",
+            [tuple(r[c] for c in cols) for r in materialized],
+        )
+
+    def record_evidence_bundles(self, rows: Iterable[dict[str, Any]]) -> None:
+        """Persist one row per forecast bundle into ``evidence_bundles``."""
+        materialized = list(rows)
+        if not materialized:
+            return
+        conn = self.connect()
+        cols = list(materialized[0].keys())
+        placeholders = ", ".join("?" * len(cols))
+        conn.executemany(
+            f"INSERT INTO evidence_bundles({', '.join(cols)}) VALUES ({placeholders})",
+            [tuple(r[c] for c in cols) for r in materialized],
+        )
+
+    def record_web_search_query(
+        self,
+        *,
+        tick_ts: str,
+        experiment_id: str,
+        market_id: str,
+        engine: str | None,
+        requests_count: int,
+        when: datetime | None = None,
+    ) -> None:
+        """Persist a per-forecast aggregate row into ``web_search_queries``."""
+        conn = self.connect()
+        ts = (when or datetime.now(tz=UTC)).astimezone(UTC).isoformat()
+        conn.execute(
+            "INSERT INTO web_search_queries(tick_ts, experiment_id, market_id, "
+            "engine, requests_count, created_at) VALUES (?,?,?,?,?,?)",
+            (tick_ts, experiment_id, market_id, engine, int(requests_count or 0), ts),
         )
 
     def record_spend(

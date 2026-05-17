@@ -13,8 +13,8 @@ from dataclasses import dataclass
 
 # --- thresholds from B and A.5/A.9 ------------------------------------------
 
-TRADE_SCORE_GATE = 0.0005
-FILL_PROB_SKIP_THRESHOLD = 0.35
+TRADE_SCORE_GATE = 0.002
+FILL_PROB_SKIP_THRESHOLD = 0.5
 PROB_EXIT_BEFORE_RESOLUTION_DEFAULT = 0.30
 ALPHA_OPP_DEFAULT = 0.5
 DAILY_HARD_CAP_DEFAULT_USD = 35.0
@@ -190,6 +190,96 @@ def fill_prob(
         * recency_factor(quote_age_sec)
     )
     return max(0.30, min(0.99, raw))
+
+
+# --- Phase 6R: fill-prob component decomposition + canary-size simulator ---
+
+
+@dataclass(frozen=True)
+class FillProbComponents:
+    """Per-factor breakdown of the A.9 fill probability.
+
+    The product of all five factors (clipped into [0.30, 0.99]) is what
+    ``fill_prob()`` returns. Surfaced so analytics can attribute a sub-0.5
+    fill-prob block to the specific dominant factor.
+    """
+
+    base: float
+    liquidity_factor: float
+    spread_factor: float
+    aggressiveness_factor: float
+    recency_factor: float
+
+    @property
+    def product(self) -> float:
+        return (
+            self.base
+            * self.liquidity_factor
+            * self.spread_factor
+            * self.aggressiveness_factor
+            * self.recency_factor
+        )
+
+    @property
+    def clipped(self) -> float:
+        return max(0.30, min(0.99, self.product))
+
+    def to_dict(self) -> dict[str, float]:
+        return {
+            "base": self.base,
+            "liquidity_factor": self.liquidity_factor,
+            "spread_factor": self.spread_factor,
+            "aggressiveness_factor": self.aggressiveness_factor,
+            "recency_factor": self.recency_factor,
+        }
+
+
+def fill_prob_components(
+    *,
+    source: str | None,
+    volume_24h: float | None,
+    spread: float | None,
+    shares: float,
+    quote_age_sec: float | None,
+) -> FillProbComponents:
+    """Return the per-factor decomposition of :func:`fill_prob`."""
+    base = BASE_FILL_PROB.get((source or "").lower(), BASE_FILL_PROB_FALLBACK)
+    depth_est = ((volume_24h or 0.0) / 96.0)
+    return FillProbComponents(
+        base=base,
+        liquidity_factor=liquidity_factor(volume_24h),
+        spread_factor=spread_factor(spread),
+        aggressiveness_factor=aggressiveness_factor(shares, depth_est),
+        recency_factor=recency_factor(quote_age_sec),
+    )
+
+
+def canary_fill_prob(
+    *,
+    source: str | None,
+    volume_24h: float | None,
+    spread: float | None,
+    side_price: float,
+    quote_age_sec: float | None,
+    canary_size_usd: float,
+) -> tuple[float, float]:
+    """Phase 6R: re-evaluate fill-prob at a canary-clipped size.
+
+    Returns ``(canary_size_usd, fill_prob_at_canary)``. The only A.9 factor
+    that depends on size is :func:`aggressiveness_factor`, so a small
+    enough size deterministically pushes the heuristic into the
+    >=0.5 zone whenever spread / volume / recency are themselves OK.
+    """
+    sp = max(1e-6, float(side_price or 0.0))
+    canary_shares = max(0.0, float(canary_size_usd)) / sp
+    fp = fill_prob(
+        source=source,
+        volume_24h=volume_24h,
+        spread=spread,
+        shares=canary_shares,
+        quote_age_sec=quote_age_sec,
+    )
+    return float(canary_size_usd), fp
 
 
 def fill_adjusted_size_usd(size_usd: float, fill_probability: float) -> float:

@@ -48,6 +48,13 @@ class LongshotLayer:
     stop_loss_suspension_hours: float = 24.0
     alpha: dict[str, float] = field(default_factory=dict)
     default_alpha: float = 1.0
+    # Phase 6: primary-mode size cap. Defaults to $25 (== min trade size in
+    # portfolio.allocate so longshot primary proposals trade only at
+    # exactly $25 when Kelly recommends >= $25). Acts as an upper clip on
+    # ``Proposal.size_usd`` for proposals whose ``edge_source`` is
+    # ``longshot_prior``.
+    primary_max_size_usd: float = 25.0
+    primary_max_per_tick: int = 1
 
     def alpha_for(self, category: str | None) -> float:
         if not category:
@@ -59,6 +66,75 @@ class LongshotLayer:
         if key in ("price", "prices", "economy"):
             return float(self.alpha.get("prices", self.default_alpha))
         return float(self.alpha.get("default", self.default_alpha))
+
+
+# --- Phase 6: env-driven primary override ---------------------------------
+
+
+@dataclass(frozen=True)
+class LongshotPrimaryConfig:
+    """Phase 6 envelope for longshot/favorite primary mode.
+
+    Read via :meth:`from_env`. Disabled by default so existing shadow-only
+    behaviour is preserved.
+
+    Env vars:
+    - ``KALIBRE_LONGSHOT_PRIMARY_ENABLED=0|1`` (default 0)
+    - ``KALIBRE_LONGSHOT_PRIMARY_MAX_SIZE_USD=25`` (default 25)
+    - ``KALIBRE_LONGSHOT_PRIMARY_MAX_PER_TICK=1`` (default 1)
+    - ``KALIBRE_LONGSHOT_PRIMARY_REQUIRE_OFFICIAL_HORIZON=0|1`` (default 1)
+      When 1, override the layer's 7-day horizon with the SDK's 30-day
+      ceiling so longshot primary candidates aren't blocked by the
+      structural-prior layer's conservative horizon.
+    """
+
+    enabled: bool = False
+    max_size_usd: float = 25.0
+    max_per_tick: int = 1
+    require_official_horizon: bool = True
+
+    @classmethod
+    def from_env(cls, env: dict[str, str] | None = None) -> "LongshotPrimaryConfig":
+        import os as _os
+        env_map = env if env is not None else dict(_os.environ)
+        enabled = (env_map.get("KALIBRE_LONGSHOT_PRIMARY_ENABLED", "").strip() == "1")
+        try:
+            max_size = float(env_map.get("KALIBRE_LONGSHOT_PRIMARY_MAX_SIZE_USD") or 25.0)
+        except ValueError:
+            max_size = 25.0
+        try:
+            max_per_tick = int(env_map.get("KALIBRE_LONGSHOT_PRIMARY_MAX_PER_TICK") or 1)
+        except ValueError:
+            max_per_tick = 1
+        require_horizon = (
+            env_map.get("KALIBRE_LONGSHOT_PRIMARY_REQUIRE_OFFICIAL_HORIZON", "1").strip() != "0"
+        )
+        return cls(
+            enabled=enabled,
+            max_size_usd=max(0.0, max_size),
+            max_per_tick=max(0, max_per_tick),
+            require_official_horizon=require_horizon,
+        )
+
+    def apply_to_layer(self, layer: LongshotLayer) -> LongshotLayer:
+        """Return a copy of ``layer`` with this config's primary knobs."""
+        # 30-day SDK ceiling expressed in days.
+        new_horizon_days = (
+            30.0 if self.require_official_horizon else layer.max_time_to_resolve_days
+        )
+        return LongshotLayer(
+            enabled=layer.enabled,
+            primary_enabled=self.enabled or layer.primary_enabled,
+            max_time_to_resolve_days=new_horizon_days,
+            max_open_longshots=layer.max_open_longshots,
+            stop_loss_window=layer.stop_loss_window,
+            stop_loss_win_rate_threshold=layer.stop_loss_win_rate_threshold,
+            stop_loss_suspension_hours=layer.stop_loss_suspension_hours,
+            alpha=layer.alpha,
+            default_alpha=layer.default_alpha,
+            primary_max_size_usd=self.max_size_usd,
+            primary_max_per_tick=self.max_per_tick,
+        )
 
 
 @dataclass(frozen=True)
@@ -133,6 +209,8 @@ def load_layers_config(
         stop_loss_suspension_hours=float(long_table.get("stop_loss_suspension_hours", 24.0)),
         alpha=alpha_map,
         default_alpha=default_alpha,
+        primary_max_size_usd=float(long_table.get("primary_max_size_usd", 25.0)),
+        primary_max_per_tick=int(long_table.get("primary_max_per_tick", 1)),
     )
     return LayersConfig(
         quote_history=quote_history, longshot=longshot, source_path=str(chosen),

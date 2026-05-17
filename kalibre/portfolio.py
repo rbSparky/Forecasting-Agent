@@ -73,6 +73,10 @@ class Proposal:
     source: str | None = None
     decision: str = "propose"
     reject_reason: str | None = None
+    # Phase 6R: per-proposal extras (fill_prob component decomposition,
+    # canary-size simulations, quote_age_sec, etc.). The dict is dumped
+    # verbatim into the proposal audit_json; never used for risk gating.
+    audit_extra: dict[str, Any] = field(default_factory=dict)
 
 
 # --- allocator --------------------------------------------------------------
@@ -147,6 +151,7 @@ def _record_reject(proposals: list[Proposal], proposal: Proposal, reason: str) -
         source=proposal.source,
         decision="reject",
         reject_reason=reason,
+        audit_extra=dict(proposal.audit_extra),
     )
     proposals.append(rejected)
     return rejected
@@ -284,6 +289,7 @@ def allocate(
             source=proposal.source,
             decision="accept",
             reject_reason=None,
+            audit_extra=dict(proposal.audit_extra),
         )
         accepted.append(accepted_proposal)
         audit.append(accepted_proposal)

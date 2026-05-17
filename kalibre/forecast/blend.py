@@ -158,6 +158,26 @@ def _inverse_variance(sigma_a: float, sigma_b: float) -> tuple[float, float, flo
     return w_a, w_b, sigma_blend
 
 
+def inverse_variance_blend(
+    p_a: float, sigma_a: float, p_b: float, sigma_b: float,
+) -> tuple[float, float]:
+    """Public Phase 6 helper: inverse-variance blend of two estimates.
+
+    Returns ``(p_blend, sigma_blend)`` both clipped into ``[P_MIN, P_MAX]``
+    / ``[SIGMA_MIN, SIGMA_MAX]``. Used by the Opus escalation route to
+    combine Sonnet and Opus probabilities. Uses the same math as the
+    Phase 3B market-prior blend so the audit story stays uniform.
+    """
+    sa = _clip(float(sigma_a), SIGMA_MIN, SIGMA_MAX)
+    sb = _clip(float(sigma_b), SIGMA_MIN, SIGMA_MAX)
+    pa = _clip(float(p_a), P_MIN, P_MAX)
+    pb = _clip(float(p_b), P_MIN, P_MAX)
+    w_a, w_b, sigma_blend = _inverse_variance(sa, sb)
+    p_blend = _clip(w_a * pa + w_b * pb, P_MIN, P_MAX)
+    sigma_blend = _clip(sigma_blend, SIGMA_MIN, SIGMA_MAX)
+    return p_blend, sigma_blend
+
+
 # --- main blender ---------------------------------------------------------
 
 

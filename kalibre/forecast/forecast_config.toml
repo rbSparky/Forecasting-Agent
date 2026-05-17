@@ -53,6 +53,12 @@ output_per_mtok = 25.0
 input_per_mtok = 5.0
 output_per_mtok = 25.0
 
+# Phase 6: Opus 4 baseline used by the optional escalation route.
+# OpenRouter exposes both this id and the dotted-version siblings above.
+[pricing."anthropic/claude-opus-4"]
+input_per_mtok = 5.0
+output_per_mtok = 25.0
+
 [pricing."anthropic/claude-haiku-4.5"]
 input_per_mtok = 1.0
 output_per_mtok = 5.0

@@ -31,18 +31,30 @@ REJECT_RESOLUTION_TOO_SOON = "universe_resolution_too_soon"
 REJECT_RESOLUTION_TOO_FAR = "universe_resolution_too_far"
 REJECT_MISSING_RESOLUTION_TIME = "universe_missing_resolution_time"
 
+# Phase 6: shadow row tag for markets that would pass every gate except the
+# 30-day horizon cap. Persisted as a `shadow_proposals` row by the loop;
+# the universe filter never trades these, so they have no effect on live
+# behaviour. Lets the operator see the would-be wider pool.
+SHADOW_HORIZON_EXTENDED = "universe_horizon_extended"
+
 
 @dataclass(frozen=True)
 class UniverseFilterConfig:
     """Tunable thresholds for the universe filter."""
 
-    min_volume_24h_usd: float = 50.0
-    max_spread_kalshi: float = 0.12
-    max_spread_polymarket: float = 0.10
-    max_spread_fallback: float = 0.12
+    min_volume_24h_usd: float = 200.0
+    max_spread_kalshi: float = 0.05
+    max_spread_polymarket: float = 0.03
+    max_spread_fallback: float = 0.05
     max_quote_age_sec: float = 600.0
-    min_hours_to_resolution: float = 2.0
-    max_hours_to_resolution: float = 365.0 * 24.0
+    min_hours_to_resolution: float = 24.0
+    # Phase 6: bumped from 21d to 30d to match the SDK ruleset
+    # (ai_prophet_core.ruleset.MAX_HOURS_TO_RESOLUTION = 720).
+    max_hours_to_resolution: float = 30.0 * 24.0
+    # Phase 6 diagnostic-only: hours beyond which a market also fails the
+    # horizon-extended shadow stream. 90 days is wide enough to capture
+    # the next regime (election markets) without flooding the report.
+    extended_diagnostic_max_hours: float = 90.0 * 24.0
 
 
 @dataclass(frozen=True)
@@ -175,3 +187,62 @@ def filter_universe(
         if decision.accepted:
             accepted.append(market)
     return tuple(accepted), tuple(decisions)
+
+
+def horizon_extended_shadow_rows(
+    markets: Iterable[MarketView],
+    *,
+    now: datetime,
+    config: UniverseFilterConfig = UniverseFilterConfig(),
+) -> tuple[UniverseDecision, ...]:
+    """Phase 6 diagnostic: markets that pass every check **except** the
+    horizon cap, within ``(max_hours_to_resolution, extended_diagnostic_max_hours]``.
+
+    Returns a tuple of :class:`UniverseDecision` with ``accepted=False`` and
+    ``reject_reason=SHADOW_HORIZON_EXTENDED``. These rows are persisted as a
+    separate ``shadow_proposals`` stream by the loop and never reach the
+    selector or the strategy. They exist so the operator can see how much
+    of the would-be wider pool we are choosing not to trade.
+    """
+    if config.extended_diagnostic_max_hours <= config.max_hours_to_resolution:
+        return ()
+    # Re-evaluate with a temporarily wider horizon to find the ones that
+    # would pass on every *other* gate.
+    wide_config = UniverseFilterConfig(
+        min_volume_24h_usd=config.min_volume_24h_usd,
+        max_spread_kalshi=config.max_spread_kalshi,
+        max_spread_polymarket=config.max_spread_polymarket,
+        max_spread_fallback=config.max_spread_fallback,
+        max_quote_age_sec=config.max_quote_age_sec,
+        min_hours_to_resolution=config.min_hours_to_resolution,
+        max_hours_to_resolution=config.extended_diagnostic_max_hours,
+        extended_diagnostic_max_hours=config.extended_diagnostic_max_hours,
+    )
+    extended: list[UniverseDecision] = []
+    seen: set[str] = set()
+    by_id = {m.market_id: m for m in markets}
+    for market in by_id.values():
+        if market.market_id in seen:
+            continue
+        seen.add(market.market_id)
+        # Skip anything that would already pass the strict filter --
+        # those land in `accepted` and are not "extended" candidates.
+        strict_decision = evaluate_market(market, now=now, config=config)
+        if strict_decision.accepted:
+            continue
+        # Re-evaluate with the wider horizon: if it still fails, this is
+        # not a horizon-bound market and we don't shadow it.
+        wide_decision = evaluate_market(market, now=now, config=wide_config)
+        if not wide_decision.accepted:
+            continue
+        extended.append(UniverseDecision(
+            market_id=market.market_id,
+            accepted=False,
+            reject_reason=SHADOW_HORIZON_EXTENDED,
+            spread=wide_decision.spread,
+            volume_24h=wide_decision.volume_24h,
+            quote_age_sec=wide_decision.quote_age_sec,
+            hours_to_resolution=wide_decision.hours_to_resolution,
+            source=wide_decision.source,
+        ))
+    return tuple(extended)

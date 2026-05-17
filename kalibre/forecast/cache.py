@@ -28,8 +28,27 @@ from kalibre.forecast.types import ForecastRequest, ForecastResult
 DEFAULT_TTL_SEC = 6 * 3600
 
 
-def cache_key(request: ForecastRequest, model: str) -> str:
-    """Stable hash of the inputs that should yield the same forecast."""
+def cache_key(
+    request: ForecastRequest,
+    model: str,
+    *,
+    web_search_enabled: bool = False,
+    web_search_engine: str | None = None,
+    evidence_hash: str | None = None,
+) -> str:
+    """Stable hash of the inputs that should yield the same forecast.
+
+    Phase 6B: ``web_search_enabled``, ``web_search_engine`` and
+    ``evidence_hash`` participate so that:
+
+    1. Pre-6B cache rows (search-off) never satisfy a 6B query.
+    2. Two evidence-bearing forecasts with different cited URLs don't
+       collide under the same key.
+
+    The hash inputs default to the pre-6B shape (``web_search_enabled=False``,
+    ``evidence_hash=None``), so callers that haven't updated still produce
+    the historical key for search-disabled forecasts.
+    """
     question = " ".join((request.question or "").split())
     resolution = (
         request.resolution_time.isoformat() if request.resolution_time else ""
@@ -39,18 +58,24 @@ def cache_key(request: ForecastRequest, model: str) -> str:
     volume = (
         round(request.volume_24h, -1) if request.volume_24h is not None else None
     )
-    raw = json.dumps(
-        {
-            "market_id": request.market_id,
-            "question": question,
-            "resolution": resolution,
-            "bid": bid,
-            "ask": ask,
-            "volume": volume,
-            "model": model,
-        },
-        sort_keys=True,
-    )
+    payload: dict = {
+        "market_id": request.market_id,
+        "question": question,
+        "resolution": resolution,
+        "bid": bid,
+        "ask": ask,
+        "volume": volume,
+        "model": model,
+    }
+    # Only add the Phase 6B keys when they would actually change behaviour
+    # so the pre-6B cache rows (no key at all) stay valid for search-off
+    # forecasts.
+    if web_search_enabled:
+        payload["web_search_enabled"] = True
+        payload["web_search_engine"] = web_search_engine or "default"
+        if evidence_hash:
+            payload["evidence_hash"] = evidence_hash
+    raw = json.dumps(payload, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -159,6 +184,12 @@ def _clone_as_cache_hit(result: ForecastResult) -> ForecastResult:
 
 
 def _result_from_dict(data: dict[str, Any]) -> ForecastResult:
+    cited = data.get("cited_urls") or ()
+    if isinstance(cited, list):
+        cited = tuple(str(u) for u in cited)
+    source_ids = data.get("source_ids") or ()
+    if isinstance(source_ids, list):
+        source_ids = tuple(str(s) for s in source_ids)
     return ForecastResult(
         market_id=str(data.get("market_id", "")),
         p_raw=data.get("p_raw"),
@@ -175,4 +206,16 @@ def _result_from_dict(data: dict[str, Any]) -> ForecastResult:
         cache_hit=bool(data.get("cache_hit", False)),
         error=data.get("error"),
         model=str(data.get("model", "")),
+        # Phase 6B/6C: restore evidence-aware fields so a cache hit
+        # carrying citations replays the same audit_json shape as the
+        # fresh call did. Without this, SQLite-cached web-search rows
+        # would lose cited_urls / evidence_quality / evidence_hash etc.
+        category=data.get("category"),
+        evidence_quality=data.get("evidence_quality"),
+        evidence_hash=data.get("evidence_hash"),
+        source_ids=source_ids,
+        cited_urls=cited,
+        key_drivers_json=data.get("key_drivers_json"),
+        stale_evidence=data.get("stale_evidence"),
+        web_search_requests=int(data.get("web_search_requests") or 0),
     )

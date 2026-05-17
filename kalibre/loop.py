@@ -77,9 +77,18 @@ from kalibre.forecast import (
     build_default_provider,
     run_forecast_pass,
 )
-from kalibre.forecast.provider import ForecastProvider, NoOpForecastProvider
+from kalibre.budget import BudgetProfile, force_opus_enabled, project_14_day_spend_usd
+from kalibre.forecast.provider import ForecastProvider, NoOpForecastProvider, build_opus_provider
+from kalibre.forecast.runner import OpusEscalationConfig
+from kalibre.forecast.web_search import WebSearchConfig
 from kalibre.canary import CanaryClipReport, CanaryConfig, apply_canary_clip
-from kalibre.layers import LayersConfig, get_default_layers_config
+from kalibre.portfolio import _format_shares as _format_shares_for_intent
+from kalibre.portfolio import Proposal
+from kalibre.layers import (
+    LayersConfig,
+    LongshotPrimaryConfig,
+    get_default_layers_config,
+)
 from kalibre.longshot import DECISION_ELIGIBLE as _LS_ELIGIBLE
 from kalibre.longshot import LongshotPassResult, run_longshot_pass
 from kalibre.progress import ExperimentDir, utcnow_iso
@@ -92,8 +101,14 @@ from kalibre.quote_history import (
 )
 from kalibre.selection import (
     SelectionPassResult,
+    SelectorExplorationConfig,
     passthrough_selector,
     select_forecast_targets,
+)
+from kalibre.universe import (
+    SHADOW_HORIZON_EXTENDED,
+    UniverseFilterConfig,
+    horizon_extended_shadow_rows,
 )
 from kalibre.spend import SpendGovernor
 from kalibre.state import StateStore
@@ -336,6 +351,10 @@ class KalibreLoop:
         layers_config: LayersConfig | None = None,
         forecast_selector: Any | None = None,
         canary_config: CanaryConfig | None = None,
+        exploration_config: SelectorExplorationConfig | None = None,
+        opus_config: OpusEscalationConfig | None = None,
+        opus_provider: ForecastProvider | None = None,
+        longshot_primary_config: LongshotPrimaryConfig | None = None,
     ) -> None:
         self.config = config
         self.api_url = api_url
@@ -387,6 +406,17 @@ class KalibreLoop:
         self._pid_owned = False
         self.last_strategy_result: StrategyResult | None = None
         self.layers_config = layers_config or get_default_layers_config()
+        # Phase 6: longshot primary env overrides applied on top of TOML layer.
+        self.longshot_primary_config = (
+            longshot_primary_config or LongshotPrimaryConfig.from_env()
+        )
+        # Replace the (immutable) longshot layer with one carrying primary
+        # caps from env. Quote-history layer is untouched.
+        self.layers_config = LayersConfig(
+            quote_history=self.layers_config.quote_history,
+            longshot=self.longshot_primary_config.apply_to_layer(self.layers_config.longshot),
+            source_path=self.layers_config.source_path,
+        )
         self.last_quote_history_pass: QuoteHistoryPassResult | None = None
         self.last_longshot_pass: LongshotPassResult | None = None
         # Phase 4B: deterministic forecast-target selector and live-canary clip.
@@ -395,6 +425,49 @@ class KalibreLoop:
         self.last_canary_report: CanaryClipReport | None = None
         self.last_selected_market_ids: list[str] = []
         self._last_tick_ctx: Any = None
+        # Phase 6: selector exploration + Opus escalation configs.
+        self.exploration_config = (
+            exploration_config or SelectorExplorationConfig.from_env()
+        )
+        self.opus_config = opus_config or OpusEscalationConfig.from_env()
+        self._opus_provider_override = opus_provider
+        self._opus_provider: ForecastProvider | None = None
+        self.last_longshot_primary_added: int = 0
+        # Phase 6D budget profile (standard|micro). The profile shapes
+        # the SpendGovernor caps, the web-search defaults, the selector
+        # exploration max, the cache TTL, and the Opus default. Operators
+        # override individual knobs via env vars; the profile only
+        # supplies *defaults* for unset env vars.
+        self.budget_profile = BudgetProfile.from_env()
+        self.force_opus = force_opus_enabled()
+        # Phase 6B: OpenRouter native web-search config (env-driven). When
+        # disabled the runner sends no `tools` to the provider; behavior
+        # matches Phase 6R2 bit-for-bit.
+        self.web_search_config = WebSearchConfig.from_env(
+            budget_profile=self.budget_profile,
+        )
+        # Phase 6D: under the micro profile, replace the global
+        # SpendGovernor caps with the profile's tighter envelope unless
+        # the caller has injected an explicit spend governor. Standard
+        # profile keeps the existing $500 / $35 / $25 envelope.
+        if spend is None and self.budget_profile.is_micro:
+            self.spend = SpendGovernor(
+                daily_soft_usd=self.budget_profile.daily_soft_usd,
+                daily_hard_usd=self.budget_profile.daily_hard_usd,
+                total_budget_usd=self.budget_profile.total_budget_usd,
+            )
+        # Phase 6D: under the micro profile, shrink the exploration max
+        # default when the env var is unset. The selector still respects
+        # KALIBRE_SELECTOR_EXPLORATION_MAX if set.
+        if (
+            self.budget_profile.is_micro
+            and not os.environ.get("KALIBRE_SELECTOR_EXPLORATION_MAX")
+        ):
+            from dataclasses import replace as _replace
+            self.exploration_config = _replace(
+                self.exploration_config,
+                exploration_max=self.budget_profile.selector_exploration_max,
+            )
 
     # --- public api ---------------------------------------------------------
 
@@ -482,7 +555,30 @@ class KalibreLoop:
     def _initialise_forecast_stack(self) -> None:
         """Lazy-init the forecast provider / cache / calibrator for forecast_dry_run."""
         if self._forecast_provider is None:
-            self._forecast_provider = self._forecast_provider_override or build_default_provider()
+            # Phase 6B: pipe env-driven web-search overrides into the
+            # provider so tools=[{"type":"openrouter:web_search",...}] is
+            # attached when KALIBRE_WEB_SEARCH_MODE=1.
+            web_overrides = (
+                self.web_search_config.to_provider_overrides()
+                if self.web_search_config.enabled else None
+            )
+            self._forecast_provider = (
+                self._forecast_provider_override
+                or build_default_provider(web_search_overrides=web_overrides)
+            )
+        # Phase 6: lazy Opus provider only when escalation is on.
+        if (
+            self.opus_config.enabled
+            and self._opus_provider is None
+        ):
+            web_overrides = (
+                self.web_search_config.to_provider_overrides()
+                if self.web_search_config.enabled else None
+            )
+            self._opus_provider = (
+                self._opus_provider_override
+                or build_opus_provider(web_search_overrides=web_overrides)
+            )
         if self._forecast_cache is None and self.state is not None:
             self._forecast_cache = self._forecast_cache_override or SQLiteForecastCache(self.state.connect())
         if self._calibrator is None:
@@ -1042,6 +1138,11 @@ class KalibreLoop:
                 },
             )
             self._last_tick_ctx = ctx
+            # --- Phase 6: horizon-extended diagnostic shadow stream ----
+            # Persists one shadow row per 30-90d candidate that would pass
+            # every other universe gate. Read-only -- never feeds the
+            # selector or strategy.
+            self._emit_horizon_extended_shadow_rows(ctx)
             # --- Phase 4A: quote-history snapshot + features --------------
             qh_pass = self._run_quote_history_pass(ctx)
             qh_features_by_market = qh_pass.features_by_market if qh_pass else {}
@@ -1063,6 +1164,17 @@ class KalibreLoop:
                     selector=self.forecast_selector,
                     layers_config=self.layers_config,
                     degraded_mode=self.spend.degraded_mode(),
+                    exploration_config=self.exploration_config,
+                    opus_provider=self._opus_provider,
+                    opus_config=self.opus_config,
+                    # Phase 6B: env-driven web-search config + today's
+                    # search-only spend (used to enforce the daily cap).
+                    web_search_config=self.web_search_config,
+                    web_search_spend_today_usd_fn=self._web_search_spend_today_usd,
+                    # Phase 6D: budget profile drives per-tick paid cap,
+                    # Opus default, cache TTL, web-search defaults.
+                    budget_profile=self.budget_profile,
+                    force_opus=self.force_opus,
                 )
                 self.last_forecast_pass = pass_result
                 self.last_selected_market_ids = list(
@@ -1089,6 +1201,46 @@ class KalibreLoop:
                                 error=_short(exc),
                                 rows=len(selection_rows),
                             )
+                # Phase 6B: persist evidence rows + bundles BEFORE the
+                # forecasts table writes so the foreign-key story (URL ->
+                # forecast row) survives even on partial persistence.
+                if self.state is not None and pass_result.evidence_rows:
+                    try:
+                        self.state.record_web_search_results(pass_result.evidence_rows)
+                    except Exception as exc:
+                        self._log(
+                            "web_search_results_persistence_failed",
+                            error=_short(exc),
+                            rows=len(pass_result.evidence_rows),
+                        )
+                if self.state is not None and pass_result.evidence_bundles:
+                    try:
+                        self.state.record_evidence_bundles(pass_result.evidence_bundles)
+                    except Exception as exc:
+                        self._log(
+                            "evidence_bundles_persistence_failed",
+                            error=_short(exc),
+                            rows=len(pass_result.evidence_bundles),
+                        )
+                # Phase 6C repair: persist per-forecast web_search_queries
+                # aggregates so the evidence_report + funnel_report can
+                # split forecasts-with-evidence from forecasts-without.
+                if self.state is not None and pass_result.web_search_query_rows:
+                    for row in pass_result.web_search_query_rows:
+                        try:
+                            self.state.record_web_search_query(
+                                tick_ts=row["tick_ts"],
+                                experiment_id=row["experiment_id"],
+                                market_id=row["market_id"],
+                                engine=row.get("engine"),
+                                requests_count=int(row.get("requests_count") or 0),
+                            )
+                        except Exception as exc:
+                            self._log(
+                                "web_search_query_persistence_failed",
+                                error=_short(exc),
+                                market_id=row.get("market_id"),
+                            )
                 if forecast_audit_rows and self.state is not None:
                     try:
                         self.state.record_forecasts(forecast_audit_rows)
@@ -1107,15 +1259,47 @@ class KalibreLoop:
                         if int(forecast_row.get("cache_hit") or 0):
                             # Cache hits are free; never charge spend_log again.
                             continue
-                        if forecast_row.get("error"):
+                        # Phase 6C forecast-repair: parse_error rows DO
+                        # carry a real api_cost_usd (the API call ran;
+                        # the JSON just couldn't be parsed). Charge them.
+                        # Pure-runner errors with no API call (spend /
+                        # deadline blocks) have api_cost_usd=0 and were
+                        # already filtered above.
+                        err = forecast_row.get("error")
+                        if err and not str(err).startswith("parse_error"):
                             continue
+                        # Phase 6B: split web-search cost from token cost so the
+                        # daily search cap can be enforced independently. The
+                        # provider stores web_search_requests in audit_json;
+                        # use the configured unit cost when available.
+                        token_cost = cost
+                        search_cost = 0.0
                         try:
-                            self.state.record_spend(
-                                model=forecast_row.get("model") or pass_result.batch.model,
-                                cost_usd=cost,
-                                purpose=forecast_row.get("edge_source") or "forecast",
+                            aj = json.loads(forecast_row.get("audit_json") or "{}")
+                        except (TypeError, ValueError):
+                            aj = {}
+                        if isinstance(aj, dict):
+                            wsr = int(aj.get("web_search_requests") or 0)
+                            unit = float(
+                                getattr(self.web_search_config, "unit_cost_usd", 0.005) or 0.005
                             )
-                            spend_persisted += 1
+                            search_cost = max(0.0, wsr * unit)
+                            token_cost = max(0.0, cost - search_cost)
+                        try:
+                            if token_cost > 0:
+                                self.state.record_spend(
+                                    model=forecast_row.get("model") or pass_result.batch.model,
+                                    cost_usd=token_cost,
+                                    purpose=forecast_row.get("edge_source") or "forecast",
+                                )
+                                spend_persisted += 1
+                            if search_cost > 0:
+                                self.state.record_spend(
+                                    model=forecast_row.get("model") or pass_result.batch.model,
+                                    cost_usd=search_cost,
+                                    purpose="web_search",
+                                )
+                                spend_persisted += 1
                         except Exception as exc:
                             spend_persist_failed += 1
                             self._log(
@@ -1152,6 +1336,18 @@ class KalibreLoop:
                 spent_today_usd=self.spend.spent_day_usd,
                 daily_api_hard_cap_usd=self.spend.daily_hard_usd,
             )
+            # Phase 6: clip longshot-primary proposals + intents to the
+            # configured per-trade dollar cap. No-op when longshot primary
+            # is disabled or no accepted proposal carries
+            # edge_source=='longshot_prior'.
+            self._clamp_longshot_primary_size(self.last_strategy_result)
+            # Phase 6R: canary fill-rescue shadow rows + optional primary
+            # promotion. Shadow-only by default. Primary promotion only
+            # fires when ALL of:
+            #   KALIBRE_CANARY_FILL_RESCUE_MODE=1
+            #   KALIBRE_ENABLE_LIVE_TRADES=1
+            #   KALIBRE_LIVE_CANARY_MODE=1
+            self._run_canary_fill_rescue(ctx=ctx, strategy_result=self.last_strategy_result)
             self.last_strategy_result.mode = self.strategy_env.mode.value
             if forecast_summary is not None:
                 self.last_strategy_result.notes.append(
@@ -1286,8 +1482,11 @@ class KalibreLoop:
         ctx: Any,
         probabilities: dict[str, MarketProbability],
     ) -> int:
-        """Phase 4A repair: when ``longshot.primary_enabled`` is true, eligible
+        """Phase 4A/6: when ``longshot.primary_enabled`` is true, eligible
         longshot rows fill in for markets that have no forecast probability.
+
+        Phase 6: respects ``primary_max_per_tick``. Size capping happens
+        post-allocator in :meth:`_clamp_longshot_primary_size_in_intents`.
 
         Returns the number of markets the longshot prior added. Live
         trading still requires ``KALIBRE_ENABLE_LIVE_TRADES=1``; this
@@ -1298,6 +1497,7 @@ class KalibreLoop:
         layer = self.layers_config.longshot
         if not layer.primary_enabled:
             return 0
+        cap = max(0, int(layer.primary_max_per_tick))
         added = 0
         for row in self.last_longshot_pass.shadow_rows:
             if row.decision != _LS_ELIGIBLE:
@@ -1306,6 +1506,8 @@ class KalibreLoop:
                 continue
             if row.p_prior is None:
                 continue
+            if cap > 0 and added >= cap:
+                break
             probabilities[row.market_id] = MarketProbability(
                 p_mean=float(row.p_prior),
                 sigma_p=0.12,  # structural-only sigma per A.3
@@ -1313,9 +1515,800 @@ class KalibreLoop:
                 model_tier="structural_only",
             )
             added += 1
+        self.last_longshot_primary_added = added
         if added:
-            self._log("longshot_primary_promoted", added=added)
+            self._log(
+                "longshot_primary_promoted",
+                added=added,
+                primary_max_per_tick=cap,
+                primary_max_size_usd=layer.primary_max_size_usd,
+            )
         return added
+
+    # --- Phase 6R / 6C: canary rescues ----------------------------------
+
+    def _run_canary_fill_rescue(
+        self,
+        *,
+        ctx: Any,
+        strategy_result: StrategyResult,
+    ) -> None:
+        """Run the Phase 6R fill-prob rescue + the Phase 6C Kelly/size
+        rescue. Emit shadow rows for every candidate. Promote AT MOST one
+        intent in total per tick (fill rescue prioritized over Kelly
+        rescue when both find a candidate).
+
+        Live-promotion requires ALL of:
+
+        - ``KALIBRE_ENABLE_LIVE_TRADES=1``
+        - ``KALIBRE_LIVE_CANARY_MODE=1``
+        - ``KALIBRE_CANARY_FILL_RESCUE_MODE=1`` (for the fill-rescue path)
+          OR ``KALIBRE_CANARY_KELLY_RESCUE_MODE=1`` (for the Kelly-rescue
+          path)
+
+        Hard guards apply to both paths:
+
+        - never rescue if ``quote_age_sec > 180``;
+        - never rescue ``model_disagreement`` rejects;
+        - Kelly rescue additionally requires ``edge_pp >= min_edge_pp``
+          (default 1.0pp).
+        """
+        env = os.environ
+        live_trades = (env.get("KALIBRE_ENABLE_LIVE_TRADES", "").strip() == "1")
+        canary_mode = (env.get("KALIBRE_LIVE_CANARY_MODE", "").strip() == "1")
+        fill_rescue_mode = (env.get("KALIBRE_CANARY_FILL_RESCUE_MODE", "").strip() == "1")
+        kelly_rescue_mode = (env.get("KALIBRE_CANARY_KELLY_RESCUE_MODE", "").strip() == "1")
+        try:
+            min_edge_pp = float(env.get("KALIBRE_CANARY_RESCUE_MIN_EDGE_PP") or 1.0)
+        except ValueError:
+            min_edge_pp = 1.0
+
+        # Phase 6C repair: pre-compute the rescue size so the Kelly
+        # collector can apply the same fill_prob-at-rescue-size gate the
+        # promoter would later use, and shadow rows match what would have
+        # been submitted.
+        try:
+            env_cap_for_collector = float(env.get("KALIBRE_CANARY_MAX_SIZE_USD") or 25.0)
+        except ValueError:
+            env_cap_for_collector = 25.0
+        rescue_size_for_check = min(25.0, max(0.0, env_cap_for_collector))
+        # Always persist shadow rows for both rescue paths so analytics
+        # can see what we would have traded.
+        fill_candidates = self._collect_canary_fill_rescue_candidates(strategy_result)
+        kelly_candidates = self._collect_canary_kelly_rescue_candidates(
+            strategy_result,
+            min_edge_pp=min_edge_pp,
+            rescue_size_usd=rescue_size_for_check,
+        )
+        if fill_candidates and self.state is not None:
+            with contextlib.suppress(Exception):
+                self.state.record_shadow_proposals(
+                    [self._fill_rescue_shadow_row(ctx, c) for c in fill_candidates]
+                )
+        if kelly_candidates and self.state is not None:
+            with contextlib.suppress(Exception):
+                self.state.record_shadow_proposals(
+                    [self._kelly_rescue_shadow_row(ctx, c, min_edge_pp) for c in kelly_candidates]
+                )
+
+        if not (live_trades and canary_mode):
+            return
+        # Cap the rescue size: respect KALIBRE_CANARY_MAX_SIZE_USD when set,
+        # but never above $25 by design. (Reuses the value the collector
+        # already validated.)
+        cap_usd = rescue_size_for_check
+
+        # Priority: fill rescue (high-confidence signal: model already
+        # passed Kelly; fill_prob alone blocked it) before Kelly rescue
+        # (lower-confidence: forcing a $25 bet on a sub-Kelly edge).
+        if fill_rescue_mode and fill_candidates:
+            self._promote_canary_fill_rescue_intent(
+                strategy_result=strategy_result,
+                candidate=fill_candidates[0],
+                rescue_size_usd=cap_usd,
+            )
+            return
+        if kelly_rescue_mode and kelly_candidates:
+            self._promote_canary_kelly_rescue_intent(
+                strategy_result=strategy_result,
+                candidate=kelly_candidates[0],
+                rescue_size_usd=cap_usd,
+                min_edge_pp=min_edge_pp,
+            )
+
+    def _collect_canary_fill_rescue_candidates(
+        self,
+        strategy_result: StrategyResult,
+    ) -> list[Proposal]:
+        """Return rejected proposals that pass Kelly/score, fail only on
+        fill_prob_below_skip, would clear fill_prob >= 0.5 at $25 or $50,
+        carry a fresh quote (age <= 180s), and are not model_disagreement.
+        Sorted by score desc, market_id for stable ordering.
+        """
+        out: list[Proposal] = []
+        for prop in strategy_result.proposals:
+            if prop.decision != "reject":
+                continue
+            if prop.reject_reason != "fill_prob_below_skip":
+                continue
+            if prop.edge_source == "model_disagreement":
+                continue
+            extra = prop.audit_extra or {}
+            try:
+                quote_age = float(extra.get("quote_age_sec") or 0.0)
+            except (TypeError, ValueError):
+                quote_age = 0.0
+            if quote_age > 180.0:
+                continue
+            try:
+                fp_25 = float(extra.get("canary_fill_prob_25") or 0.0)
+                fp_50 = float(extra.get("canary_fill_prob_50") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if fp_25 < 0.5 and fp_50 < 0.5:
+                continue
+            out.append(prop)
+        out.sort(key=lambda p: (-p.score, p.market_id))
+        return out
+
+    def _collect_canary_kelly_rescue_candidates(
+        self,
+        strategy_result: StrategyResult,
+        *,
+        min_edge_pp: float,
+        rescue_size_usd: float = 25.0,
+    ) -> list[Proposal]:
+        """Phase 6C: catch proposals where the model has positive but
+        sub-Kelly edge (rejected as ``kelly_zero`` or ``size_below_min``)
+        so a deliberate $25 canary trade can collect the label.
+
+        Filters (Phase 6C repair adds the fill-prob-at-rescue-size gate):
+
+        - ``decision == "reject"``;
+        - ``reject_reason in {kelly_zero, size_below_min,
+          size_below_min_after_clip}``;
+        - ``edge_pp >= min_edge_pp`` (side-aware against marginal price);
+        - quote fresh (``quote_age_sec <= 180``);
+        - not ``model_disagreement``;
+        - has a positive ``side_price`` and a real ``p_eff``;
+        - fill_prob recomputed at ``rescue_size_usd`` (default $25) is
+          ``>= 0.5`` -- below the gate the rescue is shadow-only.
+
+        Returns the list sorted by ``edge_pp desc, market_id`` so the
+        highest-edge candidate wins when there are several.
+        """
+        out: list[tuple[float, Proposal]] = []
+        for prop in strategy_result.proposals:
+            if prop.decision != "reject":
+                continue
+            if prop.reject_reason not in (
+                "kelly_zero", "size_below_min", "size_below_min_after_clip",
+            ):
+                continue
+            if prop.edge_source == "model_disagreement":
+                continue
+            extra = prop.audit_extra or {}
+            try:
+                quote_age = float(extra.get("quote_age_sec") or 0.0)
+            except (TypeError, ValueError):
+                quote_age = 0.0
+            if quote_age > 180.0:
+                continue
+            edge_pp = self._compute_rescue_edge_pp(prop)
+            if edge_pp is None or edge_pp < min_edge_pp:
+                continue
+            # Phase 6C repair: re-evaluate fill_prob at the rescue size.
+            # If a $25 clip still produces fill_prob < 0.5 (because the
+            # market is so thin that even small orders won't fill), this
+            # is shadow-only -- the original collector would have let it
+            # promote and likely produced a REJECTED fill.
+            fp_at_rescue = self._compute_fill_prob_at_size(prop, rescue_size_usd)
+            if fp_at_rescue is not None and fp_at_rescue < 0.5:
+                continue
+            out.append((edge_pp, prop))
+        out.sort(key=lambda t: (-t[0], t[1].market_id))
+        return [prop for _edge, prop in out]
+
+    def _compute_fill_prob_at_size(
+        self, prop: Proposal, size_usd: float,
+    ) -> float | None:
+        """Phase 6C repair: A.9 fill_prob evaluated at the would-submit
+        rescue size, using the current market quote (if available)."""
+        if self._last_tick_ctx is None:
+            return None
+        market = self._last_tick_ctx.market_by_id().get(prop.market_id)
+        if market is None:
+            return None
+        try:
+            side_price = float(prop.side_price or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if side_price <= 0.0:
+            return None
+        from kalibre.score import canary_fill_prob as _canary_fill_prob
+        q = market.quote
+        quote_age = (
+            q.quote_age_sec(self._last_tick_ctx.now)
+            if self._last_tick_ctx else None
+        )
+        _, fp = _canary_fill_prob(
+            source=prop.source or market.source,
+            volume_24h=q.volume_24h,
+            spread=q.spread,
+            side_price=side_price,
+            quote_age_sec=quote_age,
+            canary_size_usd=size_usd,
+        )
+        return float(fp)
+
+    @staticmethod
+    def _compute_rescue_edge_pp(prop: Proposal) -> float | None:
+        """Side-aware model edge in percentage points, or None if the
+        proposal lacks the prices needed to compute it.
+
+        YES side: edge_pp = (p_eff - side_price) * 100 (side_price=ask).
+        NO  side: side_price = 1 - bid, so the YES-equivalent
+                  probability we're betting against is ``1 - p_eff``
+                  and the cost-per-share is ``side_price``. Edge =
+                  ``(1 - p_eff) - side_price`` per share.
+        """
+        try:
+            side_price = float(prop.side_price or 0.0)
+            p_eff = float(prop.p_eff or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if side_price <= 0.0 or side_price >= 1.0:
+            return None
+        side = (prop.side or "YES").upper()
+        if side == "YES":
+            return (p_eff - side_price) * 100.0
+        if side == "NO":
+            return ((1.0 - p_eff) - side_price) * 100.0
+        return None
+
+    def _fill_rescue_shadow_row(self, ctx: Any, prop: Proposal) -> dict[str, Any]:
+        extra = prop.audit_extra or {}
+        audit_payload = {
+            "market_id": prop.market_id,
+            "edge_source": prop.edge_source,
+            "side": prop.side,
+            "score": prop.score,
+            "p_mean": prop.p_mean,
+            "p_eff": prop.p_eff,
+            "original_size_usd": extra.get("original_size_usd", prop.size_usd),
+            "original_shares": extra.get("original_shares", prop.shares),
+            "original_fill_prob": extra.get("original_fill_prob", prop.fill_prob),
+            "canary_size_usd_25": extra.get("canary_size_usd_25"),
+            "canary_fill_prob_25": extra.get("canary_fill_prob_25"),
+            "canary_size_usd_50": extra.get("canary_size_usd_50"),
+            "canary_fill_prob_50": extra.get("canary_fill_prob_50"),
+            "quote_age_sec": extra.get("quote_age_sec"),
+            "fill_prob_block_components": extra.get("fill_prob_block_components"),
+            "side_price": extra.get("side_price"),
+        }
+        return {
+            "variant_name": "canary_fill_rescue_shadow",
+            "tick_ts": ctx.tick_id,
+            "experiment_id": ctx.experiment_id,
+            "participant_idx": ctx.participant_idx,
+            "market_id": prop.market_id,
+            "edge_source": prop.edge_source,
+            "p_mean": prop.p_mean,
+            "sigma_p": prop.sigma_p,
+            "side": prop.side,
+            "score": prop.score,
+            "decision": "shadow",
+            "reject_reason": "fill_prob_below_skip",
+            "audit_json": json.dumps(audit_payload, default=str),
+            "created_at": datetime.now(tz=UTC).isoformat(),
+        }
+
+    def _kelly_rescue_shadow_row(
+        self, ctx: Any, prop: Proposal, min_edge_pp: float,
+    ) -> dict[str, Any]:
+        """Phase 6C: shadow row for a Kelly-rescue candidate.
+
+        Phase 6C repair: enriched with the canary-size fill_prob
+        simulations + original_fill_prob + rescue_expected_fill_prob so
+        downstream analytics can split rescued vs would-have-rescued.
+        """
+        extra = prop.audit_extra or {}
+        edge_pp = self._compute_rescue_edge_pp(prop)
+        fp_at_25 = self._compute_fill_prob_at_size(prop, 25.0)
+        fp_at_50 = self._compute_fill_prob_at_size(prop, 50.0)
+        audit_payload = {
+            "market_id": prop.market_id,
+            "edge_source": prop.edge_source,
+            "side": prop.side,
+            "score": prop.score,
+            "p_mean": prop.p_mean,
+            "p_eff": prop.p_eff,
+            "side_price": prop.side_price,
+            "rescue_edge_pp": edge_pp,
+            "rescue_min_edge_pp": min_edge_pp,
+            "original_size_usd": extra.get("original_size_usd", prop.size_usd),
+            "original_shares": extra.get("original_shares", prop.shares),
+            "original_fill_prob": extra.get(
+                "original_fill_prob", float(prop.fill_prob),
+            ),
+            "original_reject_reason": prop.reject_reason,
+            "quote_age_sec": extra.get("quote_age_sec"),
+            "canary_fill_prob_25": (
+                float(fp_at_25) if fp_at_25 is not None else None
+            ),
+            "canary_fill_prob_50": (
+                float(fp_at_50) if fp_at_50 is not None else None
+            ),
+            "rescue_expected_fill_prob": (
+                float(fp_at_25) if fp_at_25 is not None else None
+            ),
+        }
+        return {
+            "variant_name": "canary_kelly_rescue_shadow",
+            "tick_ts": ctx.tick_id,
+            "experiment_id": ctx.experiment_id,
+            "participant_idx": ctx.participant_idx,
+            "market_id": prop.market_id,
+            "edge_source": prop.edge_source,
+            "p_mean": prop.p_mean,
+            "sigma_p": prop.sigma_p,
+            "side": prop.side,
+            "score": prop.score,
+            "decision": "shadow",
+            "reject_reason": prop.reject_reason,
+            "audit_json": json.dumps(audit_payload, default=str),
+            "created_at": datetime.now(tz=UTC).isoformat(),
+        }
+
+    def _promote_canary_kelly_rescue_intent(
+        self,
+        *,
+        strategy_result: StrategyResult,
+        candidate: Proposal,
+        rescue_size_usd: float,
+        min_edge_pp: float,
+    ) -> None:
+        """Phase 6C: convert a Kelly/size_below_min rescue candidate into
+        a $25 canary intent. The size is forced to ``rescue_size_usd``
+        (capped at $25). Shares = size / side_price.
+
+        This deliberately overrides the Kelly verdict because the
+        canary clip already caps downside at $25 and we need the trade
+        to seed the calibrator with a real outcome label.
+        """
+        from dataclasses import replace as _replace
+        from kalibre.score import (
+            BASE_FILL_PROB,
+            BASE_FILL_PROB_FALLBACK,
+            fill_prob as _fill_prob,
+        )
+
+        side_price = float(candidate.side_price or candidate.audit_extra.get("side_price") or 0.0) or 1e-6
+        size_usd = min(rescue_size_usd, 25.0)
+        if size_usd < 1.0:
+            return
+        shares = size_usd / side_price
+        edge_pp = self._compute_rescue_edge_pp(candidate) or 0.0
+        # Recompute fill probability at the rescue size so the persisted
+        # audit + fill telemetry reflects what we actually submit.
+        rescue_fill_prob: float | None = None
+        if self._last_tick_ctx is not None:
+            market = self._last_tick_ctx.market_by_id().get(candidate.market_id)
+            if market is not None:
+                q = market.quote
+                quote_age = (
+                    q.quote_age_sec(self._last_tick_ctx.now)
+                    if self._last_tick_ctx else None
+                )
+                rescue_fill_prob = _fill_prob(
+                    source=candidate.source or market.source,
+                    volume_24h=q.volume_24h,
+                    spread=q.spread,
+                    shares=shares,
+                    quote_age_sec=quote_age,
+                )
+        if rescue_fill_prob is None:
+            rescue_fill_prob = float(candidate.fill_prob)
+
+        rescue_audit = dict(candidate.audit_extra or {})
+        rescue_audit["canary_kelly_rescue_applied"] = True
+        rescue_audit["rescue_size_usd"] = size_usd
+        rescue_audit["rescue_shares"] = shares
+        rescue_audit["rescue_expected_fill_prob"] = rescue_fill_prob
+        rescue_audit["submitted_expected_fill_prob"] = rescue_fill_prob
+        rescue_audit["rescue_edge_pp"] = edge_pp
+        rescue_audit["rescue_min_edge_pp"] = min_edge_pp
+        rescue_audit.setdefault(
+            "original_size_usd",
+            candidate.audit_extra.get("original_size_usd", float(candidate.size_usd)),
+        )
+        rescue_audit.setdefault(
+            "original_shares",
+            candidate.audit_extra.get("original_shares", float(candidate.shares)),
+        )
+        rescue_audit.setdefault(
+            "original_fill_prob",
+            candidate.audit_extra.get("original_fill_prob", float(candidate.fill_prob)),
+        )
+        rescue_audit["pre_rescue_decision"] = "reject"
+        rescue_audit["pre_rescue_reject_reason"] = candidate.reject_reason
+        rescued = _replace(
+            candidate,
+            size_usd=size_usd,
+            shares=shares,
+            fill_prob=float(rescue_fill_prob),
+            decision="accept",
+            reject_reason=None,
+            audit_extra=rescue_audit,
+        )
+        # Rewrite proposals list.
+        strategy_result.proposals = [
+            (rescued if p is candidate else p) for p in strategy_result.proposals
+        ]
+        if strategy_result.allocation is not None:
+            strategy_result.allocation.accepted = list(strategy_result.allocation.accepted) + [rescued]
+            strategy_result.allocation.rejected = [
+                p for p in strategy_result.allocation.rejected if p is not candidate
+            ]
+            new_intent = TradeIntentRequest(
+                market_id=rescued.market_id,
+                action=rescued.action,
+                side=rescued.side,
+                shares=_format_shares_for_intent(shares),
+                idempotency_key="",
+            )
+            strategy_result.allocation.intents = list(strategy_result.allocation.intents) + [new_intent]
+        if strategy_result.live_trades_enabled and strategy_result.allocation is not None:
+            strategy_result.intents = list(strategy_result.allocation.intents)
+        rescue_audit_row = self._build_proposal_audit_row(rescued)
+        if rescue_audit_row is not None:
+            strategy_result.audit_rows.append(rescue_audit_row)
+        self._log(
+            "canary_kelly_rescue_applied",
+            market_id=rescued.market_id,
+            size_usd=size_usd,
+            edge_pp=edge_pp,
+            edge_source=rescued.edge_source,
+        )
+
+    def _promote_canary_fill_rescue_intent(
+        self,
+        *,
+        strategy_result: StrategyResult,
+        candidate: Proposal,
+        rescue_size_usd: float,
+    ) -> None:
+        """Phase 6R primary rescue: convert one fill-rescue candidate into a
+        live intent at a clamped size. Mutates ``strategy_result`` in place.
+        The proposal moves from ``decision='reject'`` to a new
+        ``decision='accept'`` clone, and the matching intent is appended.
+
+        Phase 6R2: recomputes ``fill_prob`` at the actual submitted
+        ``rescue_size_usd`` so fill telemetry reflects the canary-size
+        expected fill probability instead of the original full-size value.
+        The original full-size ``fill_prob`` and original size/shares are
+        preserved in ``audit_extra``.
+        """
+        from dataclasses import replace as _replace
+        from kalibre.score import canary_fill_prob as _canary_fill_prob
+
+        side_price = float(candidate.side_price or candidate.audit_extra.get("side_price") or 0.0) or 1e-6
+        # Pick the smallest of: caller cap, $25 (design), or original size.
+        size_usd = min(rescue_size_usd, 25.0, float(candidate.size_usd or 25.0))
+        if size_usd < 1.0:
+            return
+        shares = size_usd / side_price
+        # Phase 6R2: re-evaluate A.9 fill_prob at the actual rescue size.
+        # The only size-dependent factor in the A.9 heuristic is
+        # aggressiveness, so this is exactly the quantity the canary
+        # intent will face on the wire.
+        market = None
+        if self._last_tick_ctx is not None:
+            market = self._last_tick_ctx.market_by_id().get(candidate.market_id)
+        rescue_fill_prob: float | None = None
+        if market is not None:
+            q = market.quote
+            quote_age = q.quote_age_sec(self._last_tick_ctx.now) if self._last_tick_ctx else None
+            _, rescue_fill_prob = _canary_fill_prob(
+                source=candidate.source or market.source,
+                volume_24h=q.volume_24h,
+                spread=q.spread,
+                side_price=side_price,
+                quote_age_sec=quote_age,
+                canary_size_usd=size_usd,
+            )
+        if rescue_fill_prob is None:
+            # Fall back to whichever canary-size simulation already exists
+            # so we never persist the stale full-size value as if it were
+            # the rescue-size value.
+            extra_25 = candidate.audit_extra.get("canary_fill_prob_25")
+            extra_50 = candidate.audit_extra.get("canary_fill_prob_50")
+            if extra_25 is not None and size_usd <= 25.0:
+                rescue_fill_prob = float(extra_25)
+            elif extra_50 is not None and size_usd <= 50.0:
+                rescue_fill_prob = float(extra_50)
+            else:
+                rescue_fill_prob = float(candidate.fill_prob)
+
+        rescue_audit = dict(candidate.audit_extra or {})
+        rescue_audit["canary_fill_rescue_applied"] = True
+        rescue_audit["rescue_size_usd"] = size_usd
+        rescue_audit["rescue_shares"] = shares
+        rescue_audit["rescue_expected_fill_prob"] = rescue_fill_prob
+        rescue_audit["submitted_expected_fill_prob"] = rescue_fill_prob
+        # Preserve the original full-size values for analytics.
+        rescue_audit.setdefault(
+            "original_fill_prob",
+            candidate.audit_extra.get("original_fill_prob", float(candidate.fill_prob)),
+        )
+        rescue_audit.setdefault(
+            "original_size_usd",
+            candidate.audit_extra.get("original_size_usd", float(candidate.size_usd)),
+        )
+        rescue_audit.setdefault(
+            "original_shares",
+            candidate.audit_extra.get("original_shares", float(candidate.shares)),
+        )
+        rescue_audit["pre_rescue_decision"] = "reject"
+        rescue_audit["pre_rescue_reject_reason"] = candidate.reject_reason
+        rescued = _replace(
+            candidate,
+            size_usd=size_usd,
+            shares=shares,
+            fill_prob=float(rescue_fill_prob),
+            decision="accept",
+            reject_reason=None,
+            audit_extra=rescue_audit,
+        )
+        # Rewrite proposals list.
+        strategy_result.proposals = [
+            (rescued if p is candidate else p) for p in strategy_result.proposals
+        ]
+        if strategy_result.allocation is not None:
+            strategy_result.allocation.accepted = list(strategy_result.allocation.accepted) + [rescued]
+            # Remove the prior rejected entry from the rejected list, if any.
+            strategy_result.allocation.rejected = [
+                p for p in strategy_result.allocation.rejected if p is not candidate
+            ]
+            new_intent = TradeIntentRequest(
+                market_id=rescued.market_id,
+                action=rescued.action,
+                side=rescued.side,
+                shares=_format_shares_for_intent(shares),
+                idempotency_key="",
+            )
+            strategy_result.allocation.intents = list(strategy_result.allocation.intents) + [new_intent]
+        if strategy_result.live_trades_enabled and strategy_result.allocation is not None:
+            strategy_result.intents = list(strategy_result.allocation.intents)
+        # Append a fresh audit row (the persisted proposals table will then
+        # show the rescue row in addition to the original-reject row).
+        rescue_audit_row = self._build_proposal_audit_row(rescued)
+        if rescue_audit_row is not None:
+            strategy_result.audit_rows.append(rescue_audit_row)
+        self._log(
+            "canary_fill_rescue_applied",
+            market_id=rescued.market_id,
+            size_usd=size_usd,
+            edge_source=rescued.edge_source,
+        )
+
+    def _build_proposal_audit_row(self, prop: Proposal) -> dict[str, Any] | None:
+        """Build a ``proposals`` table row for a rescue-promoted proposal.
+
+        Mirrors :func:`kalibre.strategy._audit_row` enough that the loop
+        can append a fresh row when it modifies the strategy result post-
+        allocation (Phase 6R canary fill rescue).
+        """
+        ctx = self._last_tick_ctx
+        if ctx is None:
+            return None
+        audit_payload: dict[str, Any] = {
+            "edge_source": prop.edge_source,
+            "tick_ts": ctx.tick_id,
+            "version": KALIBRE_VERSION,
+            "experiment_id": ctx.experiment_id,
+            "participant_idx": ctx.participant_idx,
+            "market_id": prop.market_id,
+            "topic": prop.topic,
+            "source": prop.source,
+            "p_mean": prop.p_mean,
+            "p_eff": prop.p_eff,
+            "sigma_p": prop.sigma_p,
+            "score": prop.score,
+            "fill_prob": prop.fill_prob,
+            "decision": prop.decision,
+            "reject_reason": prop.reject_reason,
+        }
+        if prop.audit_extra:
+            for k, v in prop.audit_extra.items():
+                audit_payload.setdefault(k, v)
+        return {
+            "proposal_id": f"{ctx.tick_id}:{prop.market_id}:{prop.side}:rescue",
+            "tick_ts": ctx.tick_id,
+            "experiment_id": ctx.experiment_id,
+            "participant_idx": ctx.participant_idx,
+            "market_id": prop.market_id,
+            "edge_source": prop.edge_source,
+            "version": KALIBRE_VERSION,
+            "p_mean": prop.p_mean,
+            "p_eff": prop.p_eff,
+            "sigma_p": prop.sigma_p,
+            "side": prop.side,
+            "action": prop.action,
+            "size_usd": prop.size_usd,
+            "shares": prop.shares,
+            "score": prop.score,
+            "fill_prob": prop.fill_prob,
+            "decision": prop.decision,
+            "reject_reason": prop.reject_reason,
+            "audit_json": json.dumps(audit_payload, default=str),
+        }
+
+    def _web_search_spend_today_usd(self) -> float:
+        """Phase 6B: read today's web-search spend from spend_log.
+
+        Returns 0.0 when the DB is unavailable. Used to enforce the
+        per-day search cap independently of the LLM token spend.
+        """
+        if self.state is None:
+            return 0.0
+        try:
+            conn = self.state.connect()
+            from datetime import UTC as _UTC, datetime as _datetime
+            today_key = _datetime.now(tz=_UTC).date().isoformat()
+            row = conn.execute(
+                "SELECT coalesce(sum(cost_usd), 0) FROM spend_log "
+                "WHERE day_key=? AND purpose='web_search'",
+                (today_key,),
+            ).fetchone()
+            if row and row[0] is not None:
+                return float(row[0])
+        except Exception:
+            return 0.0
+        return 0.0
+
+    def _emit_horizon_extended_shadow_rows(self, ctx: Any) -> None:
+        """Phase 6: persist the 30-90d would-pass markets as a shadow stream.
+
+        Best-effort. Failures never break the tick.
+        """
+        if self.state is None:
+            return
+        try:
+            extended = horizon_extended_shadow_rows(ctx.markets, now=ctx.now)
+        except Exception as exc:  # pragma: no cover - defensive
+            self._log("horizon_extended_compute_failed", error=_short(exc))
+            return
+        if not extended:
+            return
+        created = datetime.now(tz=UTC).isoformat()
+        rows = [
+            {
+                "variant_name": SHADOW_HORIZON_EXTENDED,
+                "tick_ts": ctx.tick_id,
+                "experiment_id": ctx.experiment_id,
+                "participant_idx": ctx.participant_idx,
+                "market_id": d.market_id,
+                "edge_source": "universe_filter",
+                "p_mean": None,
+                "sigma_p": None,
+                "side": None,
+                "score": None,
+                "decision": "shadow",
+                "reject_reason": SHADOW_HORIZON_EXTENDED,
+                "audit_json": json.dumps(
+                    {
+                        "market_id": d.market_id,
+                        "hours_to_resolution": d.hours_to_resolution,
+                        "spread": d.spread,
+                        "volume_24h": d.volume_24h,
+                        "source": d.source,
+                    },
+                    default=str,
+                ),
+                "created_at": created,
+            }
+            for d in extended
+        ]
+        try:
+            self.state.record_shadow_proposals(rows)
+        except Exception as exc:  # pragma: no cover - defensive
+            self._log(
+                "horizon_extended_persistence_failed",
+                error=_short(exc),
+                rows=len(rows),
+            )
+
+    def _clamp_longshot_primary_size(
+        self,
+        strategy_result: StrategyResult,
+    ) -> None:
+        """Phase 6: clamp accepted longshot-primary proposals to the per-trade
+        cap. Updates ``strategy_result.proposals``, ``allocation.accepted``,
+        ``allocation.intents``, ``strategy_result.intents``, and the matching
+        audit_row so persisted records reflect the clipped trade.
+
+        No-op when longshot primary is disabled or no eligible proposal is
+        present. ``edge_source='longshot_prior'`` is the single match key.
+        """
+        from dataclasses import replace as _replace
+        cap = float(self.layers_config.longshot.primary_max_size_usd or 0.0)
+        if cap <= 0.0:
+            return
+        alloc = strategy_result.allocation
+        if alloc is None or not alloc.accepted:
+            return
+        # Track edits so we can mirror them into intents + audit rows.
+        clipped_ids: dict[str, dict[str, float]] = {}
+        new_accepted: list[Any] = []
+        for prop in alloc.accepted:
+            if prop.edge_source != "longshot_prior":
+                new_accepted.append(prop)
+                continue
+            if float(prop.size_usd or 0.0) <= cap + 1e-9:
+                new_accepted.append(prop)
+                continue
+            side_price = float(prop.side_price or 0.0) or 1e-9
+            new_size = cap
+            new_shares = new_size / max(1e-9, side_price)
+            clipped_ids[prop.market_id] = {
+                "original_size_usd": float(prop.size_usd),
+                "original_shares": float(prop.shares),
+                "new_size_usd": new_size,
+                "new_shares": new_shares,
+            }
+            new_accepted.append(_replace(prop, size_usd=new_size, shares=new_shares))
+        if not clipped_ids:
+            return
+        alloc.accepted = new_accepted
+        # Reflect into the full proposals list.
+        prop_by_id = {p.market_id: p for p in new_accepted}
+        strategy_result.proposals = [
+            (prop_by_id.get(p.market_id, p) if p.edge_source == "longshot_prior"
+             and p.market_id in clipped_ids else p)
+            for p in strategy_result.proposals
+        ]
+        # Rewrite matching intents (by market_id + side + action).
+        def _fmt_shares(n: float) -> str:
+            rounded = round(n, 4)
+            text = f"{rounded:.4f}".rstrip("0").rstrip(".") or "0"
+            return text
+        for i, intent in enumerate(alloc.intents):
+            if intent.market_id not in clipped_ids:
+                continue
+            payload = clipped_ids[intent.market_id]
+            alloc.intents[i] = TradeIntentRequest(
+                market_id=intent.market_id,
+                action=intent.action,
+                side=intent.side,
+                shares=_fmt_shares(payload["new_shares"]),
+                idempotency_key=intent.idempotency_key,
+            )
+        if strategy_result.intents:
+            strategy_result.intents = list(alloc.intents) if strategy_result.live_trades_enabled else []
+        # Rewrite matching audit rows (one per proposal).
+        for row in strategy_result.audit_rows:
+            mid = row.get("market_id")
+            if mid not in clipped_ids:
+                continue
+            if row.get("decision") != "accept":
+                continue
+            payload = clipped_ids[mid]
+            row["size_usd"] = payload["new_size_usd"]
+            row["shares"] = payload["new_shares"]
+            # Patch audit_json to keep persisted state coherent.
+            with contextlib.suppress(Exception):
+                aj = json.loads(row.get("audit_json") or "{}")
+                aj["longshot_primary_clipped"] = True
+                aj["original_size_usd"] = payload["original_size_usd"]
+                aj["original_shares"] = payload["original_shares"]
+                aj["primary_max_size_usd"] = cap
+                row["audit_json"] = json.dumps(aj, default=str)
+        self._log(
+            "longshot_primary_clipped",
+            markets=list(clipped_ids.keys()),
+            cap_usd=cap,
+        )
 
     def _build_intent_provenance(
         self,
@@ -1387,6 +2380,25 @@ class KalibreLoop:
                     "strategy_mode": strategy_mode,
                     "size_usd": prop.size_usd,
                 }
+                # Phase 6R2: preserve original (pre-rescue) full-size
+                # fill_prob and the canary-size simulations so analysts
+                # can split "what was submitted" from "what the full-size
+                # proposal would have looked like".
+                extra = prop.audit_extra or {}
+                for key in (
+                    "canary_fill_rescue_applied",
+                    "rescue_size_usd",
+                    "rescue_shares",
+                    "rescue_expected_fill_prob",
+                    "submitted_expected_fill_prob",
+                    "original_fill_prob",
+                    "original_size_usd",
+                    "original_shares",
+                    "canary_fill_prob_25",
+                    "canary_fill_prob_50",
+                ):
+                    if key in extra:
+                        audit_payload.setdefault(key, extra[key])
             else:
                 # No accepted-proposal match -> legacy or unknown
                 # path. Fall back to a non-misleading edge_source.
@@ -1573,6 +2585,26 @@ class KalibreLoop:
                 "quote_age_sec_at_decision": quote_age,
                 **audit_extra,
             }
+            # Phase 6R2: preserve rescue provenance in the fill audit so
+            # downstream analytics can recover the original full-size
+            # expected_fill_prob (and the canary-size simulations) even
+            # after the rescue clamp.
+            if prop is not None and prop.audit_extra:
+                pextra = prop.audit_extra
+                for key in (
+                    "canary_fill_rescue_applied",
+                    "rescue_size_usd",
+                    "rescue_shares",
+                    "rescue_expected_fill_prob",
+                    "submitted_expected_fill_prob",
+                    "original_fill_prob",
+                    "original_size_usd",
+                    "original_shares",
+                    "canary_fill_prob_25",
+                    "canary_fill_prob_50",
+                ):
+                    if key in pextra:
+                        audit_payload.setdefault(key, pextra[key])
             rows.append({
                 "intent_id": intent_id,
                 "tick_ts": tick_id or "",

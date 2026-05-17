@@ -31,6 +31,9 @@ class ForecastRequest:
     volume_24h: float | None
     rules: str | None = None
     description: str | None = None
+    # Phase 6B: deterministic category stamp (e.g. "soccer", "nfl",
+    # "weather"). Computed by the runner via kalibre.categories.
+    category: str | None = None
 
     @property
     def mid(self) -> float:
@@ -64,6 +67,16 @@ class ForecastResult:
     cache_hit: bool = False
     error: str | None = None
     model: str = ""
+    # Phase 6B: evidence-aware forecast extras. All additive, defaulted so
+    # pre-6B callers / cache rows stay valid.
+    category: str | None = None
+    evidence_quality: float | None = None
+    evidence_hash: str | None = None
+    source_ids: tuple[str, ...] = field(default_factory=tuple)
+    cited_urls: tuple[str, ...] = field(default_factory=tuple)
+    key_drivers_json: str | None = None
+    stale_evidence: bool | None = None
+    web_search_requests: int = 0
 
     @property
     def succeeded(self) -> bool:

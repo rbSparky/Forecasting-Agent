@@ -35,7 +35,9 @@ from kalibre.score import (
     DAILY_HARD_CAP_DEFAULT_USD,
     FILL_PROB_SKIP_THRESHOLD,
     TRADE_SCORE_GATE,
+    canary_fill_prob,
     evaluate_proposal_score,
+    fill_prob_components,
 )
 from kalibre.sizing import (
     SizingInputs,
@@ -61,12 +63,21 @@ class StrategyMode(str, Enum):
 
 @dataclass(frozen=True)
 class MarketProbability:
-    """Probability input for one market."""
+    """Probability input for one market.
+
+    ``p_mean`` and ``sigma_p`` are the *post-market-blend* values the
+    strategy consumes. The optional ``p_model_only`` / ``sigma_model_only``
+    fields preserve the *pre-market-blend* calibrated model probability
+    so a later combiner (Phase 6R Opus path) can combine raw model
+    estimates without double-counting the market prior.
+    """
 
     p_mean: float
     sigma_p: float = 0.10
     edge_source: str = "external"
     model_tier: str = "external"
+    p_model_only: float | None = None
+    sigma_model_only: float | None = None
 
 
 @dataclass
@@ -319,10 +330,55 @@ def _score_proposal(
 
     decision = "propose"
     reject_reason: str | None = None
-    if breakdown.score < score_gate:
+    # Phase 6: Opus escalation flags markets where Sonnet and Opus disagree
+    # by more than the configured threshold. We hold rather than trade --
+    # auditable, no surprise short-side exposure.
+    if prob.edge_source == "model_disagreement":
+        decision, reject_reason = "reject", "model_disagreement"
+    elif breakdown.score < score_gate:
         decision, reject_reason = "reject", "score_below_gate"
     elif breakdown.fill_prob < fill_prob_skip_threshold:
         decision, reject_reason = "reject", "fill_prob_below_skip"
+
+    # Phase 6R: per-proposal audit additions (fill-prob component
+    # decomposition + canary-size simulations + raw quote age). Used by
+    # the canary fill-rescue shadow stream and the funnel report; never
+    # used to mutate the gating decision above.
+    components = fill_prob_components(
+        source=market.source,
+        volume_24h=market.quote.volume_24h,
+        spread=spread,
+        shares=sizing.shares,
+        quote_age_sec=quote_age_sec,
+    )
+    _, canary_fp_25 = canary_fill_prob(
+        source=market.source,
+        volume_24h=market.quote.volume_24h,
+        spread=spread,
+        side_price=side_price,
+        quote_age_sec=quote_age_sec,
+        canary_size_usd=25.0,
+    )
+    _, canary_fp_50 = canary_fill_prob(
+        source=market.source,
+        volume_24h=market.quote.volume_24h,
+        spread=spread,
+        side_price=side_price,
+        quote_age_sec=quote_age_sec,
+        canary_size_usd=50.0,
+    )
+    audit_extra = {
+        "original_size_usd": float(sizing.size_usd),
+        "original_shares": float(sizing.shares),
+        "original_fill_prob": float(breakdown.fill_prob),
+        "canary_size_usd_25": 25.0,
+        "canary_fill_prob_25": float(canary_fp_25),
+        "canary_size_usd_50": 50.0,
+        "canary_fill_prob_50": float(canary_fp_50),
+        "quote_age_sec": float(quote_age_sec),
+        "fill_prob_block_components": components.to_dict(),
+        "side_price": float(side_price),
+    }
 
     return Proposal(
         market_id=market.market_id,
@@ -341,6 +397,7 @@ def _score_proposal(
         source=market.source,
         decision=decision,
         reject_reason=reject_reason,
+        audit_extra=audit_extra,
     )
 
 
@@ -372,6 +429,28 @@ def _proposal_from_hold(
 
 
 def _audit_row(p: Proposal, ctx: TickContext) -> dict[str, Any]:
+    audit_payload: dict[str, Any] = {
+        "edge_source": p.edge_source,
+        "tick_ts": ctx.tick_id,
+        "version": ctx.version,
+        "experiment_id": ctx.experiment_id,
+        "participant_idx": ctx.participant_idx,
+        "market_id": p.market_id,
+        "topic": p.topic,
+        "source": p.source,
+        "p_mean": p.p_mean,
+        "p_eff": p.p_eff,
+        "sigma_p": p.sigma_p,
+        "score": p.score,
+        "fill_prob": p.fill_prob,
+        "decision": p.decision,
+        "reject_reason": p.reject_reason,
+    }
+    # Phase 6R: merge per-proposal audit extras (fill_prob components,
+    # canary-size simulations, quote_age_sec). Never overrides primary keys.
+    if p.audit_extra:
+        for k, v in p.audit_extra.items():
+            audit_payload.setdefault(k, v)
     return {
         "proposal_id": f"{ctx.tick_id}:{p.market_id}:{p.side}",
         "tick_ts": ctx.tick_id,
@@ -391,26 +470,7 @@ def _audit_row(p: Proposal, ctx: TickContext) -> dict[str, Any]:
         "fill_prob": p.fill_prob,
         "decision": p.decision,
         "reject_reason": p.reject_reason,
-        "audit_json": json.dumps(
-            {
-                "edge_source": p.edge_source,
-                "tick_ts": ctx.tick_id,
-                "version": ctx.version,
-                "experiment_id": ctx.experiment_id,
-                "participant_idx": ctx.participant_idx,
-                "market_id": p.market_id,
-                "topic": p.topic,
-                "source": p.source,
-                "p_mean": p.p_mean,
-                "p_eff": p.p_eff,
-                "sigma_p": p.sigma_p,
-                "score": p.score,
-                "fill_prob": p.fill_prob,
-                "decision": p.decision,
-                "reject_reason": p.reject_reason,
-            },
-            default=str,
-        ),
+        "audit_json": json.dumps(audit_payload, default=str),
     }
 
 

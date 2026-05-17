@@ -48,6 +48,11 @@ class ShadowReport:
     forecast_selection_reject_reasons: dict[str, int] = field(default_factory=dict)
     forecast_selection_selected_ids: list[str] = field(default_factory=list)
     forecast_selection_top_skipped: list[dict[str, Any]] = field(default_factory=list)
+    # Phase 6: exploration-promoted markets pulled from skip_efficient_market.
+    forecast_selection_exploration_promotions: int = 0
+    forecast_selection_exploration_promotion_ids: list[str] = field(default_factory=list)
+    # Phase 6: horizon-extended would-pass diagnostic stream.
+    horizon_extended_count: int = 0
     spend_log_count: int = 0
     spend_log_total_usd: float = 0.0
     examples: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
@@ -233,6 +238,31 @@ def build_report(db_path: str | Path) -> ShadowReport:
                 "ORDER BY score DESC, market_id",
                 limit=5,
             )
+            # Phase 6: exploration-promoted ids from audit_json.
+            explorer_rows = list(conn.execute(
+                "SELECT market_id, audit_json FROM shadow_proposals "
+                "WHERE variant_name='forecast_selection' AND decision='select' "
+                "ORDER BY score DESC, market_id"
+            ))
+            explorer_ids: list[str] = []
+            for market_id, audit_json in explorer_rows:
+                if not audit_json:
+                    continue
+                try:
+                    payload = json.loads(audit_json)
+                except (TypeError, ValueError):
+                    continue
+                if payload.get("selection_reason") == "selected_efficient_exploration":
+                    explorer_ids.append(str(market_id))
+            report.forecast_selection_exploration_promotions = len(explorer_ids)
+            report.forecast_selection_exploration_promotion_ids = explorer_ids
+
+            # Phase 6: horizon-extended shadow stream counter.
+            report.horizon_extended_count = _count(
+                conn,
+                "SELECT count(*) FROM shadow_proposals "
+                "WHERE variant_name='universe_horizon_extended'",
+            )
 
         if _has_table(conn, "spend_log"):
             report.spend_log_count = _count(conn, "SELECT count(*) FROM spend_log")
@@ -304,6 +334,19 @@ def render_report(report: ShadowReport) -> str:
         if report.forecast_selection_selected_ids:
             preview = ", ".join(report.forecast_selection_selected_ids[:12])
             lines.append(f"  selected_market_ids: {preview}")
+        if report.forecast_selection_exploration_promotions:
+            preview = ", ".join(report.forecast_selection_exploration_promotion_ids[:12])
+            lines.append(
+                f"  exploration_promotions: "
+                f"{report.forecast_selection_exploration_promotions} ({preview})"
+            )
+    if report.horizon_extended_count:
+        lines.append("")
+        lines.append("## Phase 6 horizon-extended shadow stream")
+        lines.append(
+            f"  universe_horizon_extended rows: {report.horizon_extended_count} "
+            "(30-90d would-pass markets; never traded)"
+        )
         if report.forecast_selection_top_skipped:
             lines.append("  top skipped (highest score among skips):")
             for row in report.forecast_selection_top_skipped:
