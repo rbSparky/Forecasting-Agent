@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
@@ -33,11 +34,36 @@ def _build_slug() -> str:
 
 
 def _ensure_env_defaults() -> None:
+    # Eval-run defaults.
     os.environ.setdefault("PA_MAX_TICKS", "1500")
     os.environ.setdefault("PA_STARTING_CASH", "10000")
     os.environ.setdefault("KALIBRE_STRATEGY_MODE", "forecast_dry_run")
     os.environ.setdefault("KALIBRE_ENABLE_LIVE_TRADES", "1")
     os.environ.setdefault("KALIBRE_MAX_FORECAST_MARKETS", "8")
+
+    # Phase 6D/6E validated-pipeline defaults. ``setdefault`` preserves
+    # any value the Render dashboard / operator sets at deploy time.
+    # Budget envelope: $50 total / $3.25 daily / $0.05 per-tick paid cap.
+    os.environ.setdefault("KALIBRE_BUDGET_PROFILE", "micro")
+    # Forecast routing.
+    os.environ.setdefault("KALIBRE_WEB_SEARCH_MODE", "1")
+    os.environ.setdefault("KALIBRE_SELECTOR_EXPLORATION_MODE", "1")
+    # Opus escalation: enabled but profile-gated. Under the micro
+    # profile it only fires when blended edge >=
+    # KALIBRE_AUTO_OPUS_MIN_EDGE_PP (default 1.0pp).
+    os.environ.setdefault("KALIBRE_OPUS_ESCALATION_MODE", "1")
+    os.environ.setdefault("KALIBRE_OPUS_MAX_CALLS_PER_TICK", "1")
+    # Live canary safety caps. Without these, intents bypass the
+    # per-trade clip and submit at full Kelly size.
+    os.environ.setdefault("KALIBRE_LIVE_CANARY_MODE", "1")
+    os.environ.setdefault("KALIBRE_CANARY_MAX_INTENTS", "1")
+    os.environ.setdefault("KALIBRE_CANARY_MAX_SIZE_USD", "25")
+    # Kelly-rescue promotion: the path that produced actionable
+    # candidates in pre-deploy testing. Without this, rescue-eligible
+    # markets emit shadow rows only.
+    os.environ.setdefault("KALIBRE_CANARY_KELLY_RESCUE_MODE", "1")
+    os.environ.setdefault("KALIBRE_CANARY_RESCUE_MIN_EDGE_PP", "1.0")
+
     os.environ["PA_EXPERIMENT_SLUG"] = _build_slug()
 
 
@@ -47,22 +73,48 @@ def _start_loop() -> None:
         if RUN_PROC is not None and RUN_PROC.poll() is None:
             return
         _ensure_env_defaults()
-        log_path = ROOT / f"kalibre_service_{os.environ['PA_EXPERIMENT_SLUG']}.log"
-        log_fp = open(log_path, "a", buffering=1)
+        # Pipe the loop's stdout/stderr through the parent process so
+        # Render's Logs tab streams the actual kalibre output. Without
+        # this, all forecast / spend / error logs hide in a file inside
+        # the ephemeral container filesystem.
+        env = os.environ.copy()
+        env.setdefault("PYTHONUNBUFFERED", "1")
         proc = subprocess.Popen(
-            ["python", "-m", "kalibre.loop"],
+            ["python", "-u", "-m", "kalibre.loop"],
             cwd=str(ROOT),
-            env=os.environ.copy(),
-            stdout=log_fp,
-            stderr=subprocess.STDOUT,
+            env=env,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
             text=True,
         )
         RUN_PROC = proc
         RUN_META = {
             "slug": os.environ["PA_EXPERIMENT_SLUG"],
-            "log_path": str(log_path),
             "started_at": datetime.now(tz=UTC).isoformat(),
         }
+
+
+def _supervisor_loop() -> None:
+    """Resurrect the kalibre subprocess if it dies.
+
+    Render Starter (512MB) can OOM-kill the loop mid web-search.
+    Without a supervisor, FastAPI keeps serving /healthz while the bot
+    is dead. Poll every 30s; respawn if poll() returns non-None.
+    """
+    while True:
+        try:
+            with LOCK:
+                dead = RUN_PROC is None or RUN_PROC.poll() is not None
+            if dead:
+                print(
+                    f"[supervisor] subprocess dead "
+                    f"(exit_code={RUN_PROC.poll() if RUN_PROC else None}), respawning",
+                    flush=True,
+                )
+                _start_loop()
+        except Exception as exc:
+            print(f"[supervisor] error: {exc}", flush=True)
+        threading.Event().wait(30)
 
 
 app = FastAPI(title="Kalibre Trading Agent", version="1.0.0")
@@ -71,6 +123,12 @@ app = FastAPI(title="Kalibre Trading Agent", version="1.0.0")
 @app.on_event("startup")
 def on_startup() -> None:
     _start_loop()
+    # Background supervisor: respawn the kalibre subprocess if Render
+    # OOM-kills it or it crashes. Without this, a single failure leaves
+    # the bot dead for the rest of the eval window.
+    threading.Thread(
+        target=_supervisor_loop, name="kalibre-supervisor", daemon=True,
+    ).start()
 
 
 @app.get("/healthz")
