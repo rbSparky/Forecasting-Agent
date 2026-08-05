@@ -41,7 +41,7 @@ NPZ_URL = (
     "https://raw.githubusercontent.com/yandex-research/"
     "heterophilous-graphs/main/data/roman_empire.npz"
 )
-UA = {"User-Agent": "RomanFSPAnonymousValidation/1.0 (academic reproducibility)"}
+UA = {"User-Agent": "RomanFSPAnonymousValidation/1.1 (academic reproducibility)"}
 
 
 def emit(**obj) -> None:
