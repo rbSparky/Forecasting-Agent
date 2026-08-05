@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """Reconstruct Roman-empire labels from the public dataset generator.
 
-This is an isolated reproducibility experiment. The benchmark's labels are a
-fixed coarsening of dependency relations emitted by spaCy's en_core_web_trf
-3.6.1 on a fixed Wikipedia article. The current en_core_web_hftrf 3.8.1
-package is the same model weights repackaged in safetensors format.
-
-The parser is frozen. Task adaptation is either the published fixed relation
-map or a training-mask-only contingency projection, so deleting a training
-node is exactly implemented by subtracting its count and rebuilding the table.
+The benchmark's labels are a fixed coarsening of dependency relations emitted
+by spaCy's en_core_web_trf 3.6.1 on a fixed Wikipedia article. The parser is
+frozen. Task adaptation is either the published fixed relation map or a
+training-mask-only contingency projection, so deleting a training node is
+exactly implemented by subtracting its count and rebuilding the table.
 """
 from __future__ import annotations
 
 import ast
 import json
+import os
 import string
 import time
 from pathlib import Path
@@ -98,7 +96,6 @@ def extract_exact_text() -> str:
     if article is None:
         raise RuntimeError("embedded Roman Empire article was not found")
 
-    # Exact normalization cells in the public generator notebook.
     article = article.replace(" ( ; ) ", " ")
     article = article.replace("\n\n", " ")
     (OUT / "article.txt").write_text(article, encoding="utf-8")
@@ -107,8 +104,7 @@ def extract_exact_text() -> str:
 
 
 def load_benchmark() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    raw = download(NPZ_URL, OUT / "roman_empire.npz")
-    del raw
+    download(NPZ_URL, OUT / "roman_empire.npz")
     data = np.load(OUT / "roman_empire.npz", allow_pickle=False)
     labels = np.asarray(data["node_labels"], dtype=np.int64).reshape(-1)
     edges = np.asarray(data["edges"], dtype=np.int64)
@@ -129,7 +125,6 @@ def reconstruct(doc: spacy.tokens.Doc) -> tuple[list[str], np.ndarray, set[tuple
     edges: set[tuple[int, int]] = set()
     word_id = 0
 
-    # Deliberately mirrors the notebook, including its string-keyed lookup.
     for sentence in doc.sents:
         word_to_id: dict[str, int] = {}
         retained: list[tuple[spacy.tokens.Token, str]] = []
@@ -244,13 +239,7 @@ def training_only_projection(
         vals.append(val)
         tests.append(test)
         mappings.append(mapping.tolist())
-        emit(
-            method="FrozenParserTrainProjection",
-            split=split,
-            val=val,
-            test=test,
-            closed_split=test >= TARGET,
-        )
+        emit(method="FrozenParserTrainProjection", split=split, val=val, test=test, closed_split=test >= TARGET)
     summary = {
         "method": "FrozenParserTrainProjection10",
         "val_mean": float(np.mean(vals)),
@@ -274,20 +263,28 @@ def main() -> None:
     started = time.time()
     article = extract_exact_text()
     labels, official_edges, train_masks, val_masks, test_masks = load_benchmark()
-    emit(
-        method="benchmark",
-        nodes=len(labels),
-        edges=len(official_edges),
-        splits=train_masks.shape[1],
-    )
+    emit(method="benchmark", nodes=len(labels), edges=len(official_edges), splits=train_masks.shape[1])
 
     spacy.require_cpu()
-    nlp = spacy.load("en_core_web_hftrf")
+    requested_model = os.environ.get("ROMAN_SPACY_MODEL", "en_core_web_trf")
+    candidates = [requested_model, "en_core_web_trf", "en_core_web_hftrf"]
+    nlp = None
+    errors: dict[str, str] = {}
+    for model_name in dict.fromkeys(candidates):
+        try:
+            nlp = spacy.load(model_name)
+            requested_model = model_name
+            break
+        except Exception as exc:  # preserve diagnostics for archived/repacked models
+            errors[model_name] = repr(exc)
+    if nlp is None:
+        raise RuntimeError(f"no parser model loaded: {errors}")
     nlp.max_length = max(nlp.max_length, len(article) + 1000)
     disabled = [name for name in ("attribute_ruler", "lemmatizer", "ner") if name in nlp.pipe_names]
     print(
         "SPACY",
         spacy.__version__,
+        requested_model,
         nlp.meta.get("name"),
         nlp.meta.get("version"),
         nlp.pipe_names,
@@ -298,44 +295,25 @@ def main() -> None:
     parse_started = time.time()
     with nlp.select_pipes(disable=disabled):
         doc = nlp(article)
-    emit(
-        method="parse_runtime",
-        seconds=time.time() - parse_started,
-        raw_tokens=len(doc),
-        sentences=sum(1 for _ in doc.sents),
-    )
+    emit(method="parse_runtime", seconds=time.time() - parse_started, raw_tokens=len(doc), sentences=sum(1 for _ in doc.sents))
 
     words, dependencies, reconstructed_edges = reconstruct(doc)
     (OUT / "tokens.json").write_text(json.dumps(words, ensure_ascii=False), encoding="utf-8")
-    (OUT / "dependencies.json").write_text(
-        json.dumps(dependencies.tolist(), ensure_ascii=False), encoding="utf-8"
-    )
-    emit(
-        method="filtered_parse",
-        nodes=len(words),
-        benchmark_nodes=len(labels),
-        unique_dependencies=len(set(dependencies.tolist())),
-    )
+    (OUT / "dependencies.json").write_text(json.dumps(dependencies.tolist(), ensure_ascii=False), encoding="utf-8")
+    emit(method="filtered_parse", nodes=len(words), benchmark_nodes=len(labels), unique_dependencies=len(set(dependencies.tolist())))
     graph_agreement(reconstructed_edges, official_edges)
 
     if len(words) != len(labels):
-        raise RuntimeError(
-            f"token alignment failed: reconstructed={len(words)}, benchmark={len(labels)}"
-        )
+        raise RuntimeError(f"token alignment failed: reconstructed={len(words)}, benchmark={len(labels)}")
 
     published = np.asarray([DEP_TO_ID.get(dep, 17) for dep in dependencies], dtype=np.int64)
     overall = 100.0 * float(np.mean(published == labels))
-    emit(
-        method="GeneratorMapOverall",
-        accuracy=overall,
-        errors=int(np.sum(published != labels)),
-    )
+    emit(method="GeneratorMapOverall", accuracy=overall, errors=int(np.sum(published != labels)))
     fixed = report_fixed("FrozenParserGeneratorMap", published, labels, val_masks, test_masks)
-    projected = training_only_projection(
-        dependencies, labels, train_masks, val_masks, test_masks
-    )
+    projected = training_only_projection(dependencies, labels, train_masks, val_masks, test_masks)
 
     summary = {
+        "model": requested_model,
         "nodes": len(words),
         "overall_generator_accuracy": overall,
         "fixed": fixed,
