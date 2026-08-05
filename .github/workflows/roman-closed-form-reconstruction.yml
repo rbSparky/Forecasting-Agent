@@ -25,12 +25,12 @@ jobs:
         run: |
           set -euxo pipefail
           python -m pip install --upgrade pip wheel
-          python -m pip install --index-url https://download.pytorch.org/whl/cpu 'torch>=2.2,<3'
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu 'torch==2.5.1+cpu'
           python -m pip install 'numpy<2' requests click 'spacy>=3.8,<3.9' 'spacy-transformers>=1.4,<1.5'
           python -m pip install 'https://github.com/explosion/spacy-models/releases/download/en_core_web_hftrf-3.8.1/en_core_web_hftrf-3.8.1-py3-none-any.whl'
           python - <<'PY'
-          import click, spacy
-          print('click', click.__version__, 'spacy', spacy.__version__)
+          import importlib.metadata, torch, spacy
+          print('torch', torch.__version__, 'click', importlib.metadata.version('click'), 'spacy', spacy.__version__)
           PY
       - name: Reconstruct and evaluate all official splits
         working-directory: experiments/roman_closed_form
