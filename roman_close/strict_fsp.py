@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
-"""Strict locked validation of Frozen Syntactic Projection (FSP).
+"""Leakage-audited locked validation of Frozen Syntactic Projection (FSP).
 
-Protocol
---------
-* Fixed feature extractor: spaCy en_core_web_sm 3.8.0.
-* Exact public source/preprocessing from the Roman-empire construction notebook.
-* The parser-to-benchmark label projection is estimated independently on each
-  official training mask by a smoothed contingency-table argmax.
-* No hyperparameter, model, or mapping is selected from validation or test.
-* All ten official test masks are evaluated once.
-* Exact unlearning is verified by sufficient-statistic subtraction against a
-  complete from-scratch recomputation.
+The parser's dependency strings are converted into an anonymous vocabulary by
+sorting the strings emitted over the unlabeled source. No Roman-empire class
+ontology, class ordering, generator label dictionary, validation label, or test
+label is used to define the relation features. Each official training mask alone
+learns the anonymous-relation -> benchmark-class projection.
 """
 from __future__ import annotations
 
@@ -27,7 +22,7 @@ import spacy
 from sklearn.metrics import accuracy_score
 
 ROOT = Path(__file__).resolve().parent
-OUT = ROOT / "strict_out"
+OUT = ROOT / "anonymous_out"
 OUT.mkdir(exist_ok=True)
 MODEL = "en_core_web_sm"
 MODEL_VERSION = "3.8.0"
@@ -46,13 +41,7 @@ NPZ_URL = (
     "https://raw.githubusercontent.com/yandex-research/"
     "heterophilous-graphs/main/data/roman_empire.npz"
 )
-UA = {"User-Agent": "RomanFSPValidation/1.0 (academic reproducibility)"}
-DEP_TO_ROW = {
-    "ROOT": 0, "pobj": 1, "prep": 2, "det": 3, "amod": 4,
-    "conj": 5, "nsubj": 6, "cc": 7, "dobj": 8, "advmod": 9,
-    "compound": 10, "aux": 11, "appos": 12, "auxpass": 13,
-    "nsubjpass": 14, "poss": 15, "relcl": 16,
-}
+UA = {"User-Agent": "RomanFSPAnonymousValidation/1.0 (academic reproducibility)"}
 
 
 def emit(**obj) -> None:
@@ -101,7 +90,10 @@ def benchmark():
     return y, mask("train_masks"), mask("val_masks"), mask("test_masks"), path
 
 
-def parse_relations(text: str, expected_nodes: int) -> tuple[np.ndarray, list[str], float]:
+def parse_relations(
+    text: str,
+    expected_nodes: int,
+) -> tuple[np.ndarray, list[str], list[str], float]:
     start = time.perf_counter()
     nlp = spacy.load(MODEL)
     if nlp.meta.get("version") != MODEL_VERSION:
@@ -112,48 +104,77 @@ def parse_relations(text: str, expected_nodes: int) -> tuple[np.ndarray, list[st
     tokens = [token for sent in doc.sents for token in sent if str(token) not in punct]
     if len(tokens) != expected_nodes:
         raise RuntimeError(f"Token alignment failed: {len(tokens)} != {expected_nodes}")
-    relations = np.asarray([DEP_TO_ROW.get(token.dep_, 17) for token in tokens], dtype=np.int64)
+
+    # Completely label-independent anonymous relation indexing.
+    dep_strings = [token.dep_ for token in tokens]
+    vocabulary = sorted(set(dep_strings))
+    relation_to_id = {name: index for index, name in enumerate(vocabulary)}
+    relations = np.asarray([relation_to_id[name] for name in dep_strings], dtype=np.int64)
     words = [str(token) for token in tokens]
     elapsed = time.perf_counter() - start
-    np.save(OUT / "parser_relations.npy", relations)
+
+    np.save(OUT / "anonymous_relations.npy", relations)
+    (OUT / "relation_vocabulary.json").write_text(
+        json.dumps(vocabulary, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     (OUT / "tokens.json").write_text(json.dumps(words, ensure_ascii=False), encoding="utf-8")
-    return relations, words, elapsed
+    return relations, words, vocabulary, elapsed
 
 
-def statistics(relations: np.ndarray, y: np.ndarray, selected: np.ndarray) -> np.ndarray:
-    counts = np.zeros((N_CLASSES, N_CLASSES), dtype=np.int64)
-    np.add.at(counts, (relations[selected], y[selected]), 1)
-    return counts
+def statistics(
+    relations: np.ndarray,
+    y: np.ndarray,
+    selected: np.ndarray,
+    n_relations: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    relation_class = np.zeros((n_relations, N_CLASSES), dtype=np.int64)
+    class_counts = np.zeros(N_CLASSES, dtype=np.int64)
+    np.add.at(relation_class, (relations[selected], y[selected]), 1)
+    np.add.at(class_counts, y[selected], 1)
+    return relation_class, class_counts
 
 
-def projection(counts: np.ndarray) -> np.ndarray:
-    # Alpha is fixed before evaluation. Adding the same alpha to every cell does
-    # not alter a non-tied argmax, but specifies deterministic unseen-row behavior.
-    return (counts.astype(np.float64) + ALPHA).argmax(axis=1)
+def projection(relation_class: np.ndarray, class_counts: np.ndarray) -> np.ndarray:
+    prior = class_counts.astype(np.float64)
+    prior /= max(float(prior.sum()), 1.0)
+    # Training-prior backoff defines unseen anonymous relations without using
+    # validation/test labels. For observed rows the data counts dominate.
+    return (relation_class.astype(np.float64) + ALPHA * prior[None, :]).argmax(axis=1)
 
 
 def exact_unlearning_checks(
     relations: np.ndarray,
     y: np.ndarray,
     train: np.ndarray,
-    base_counts: np.ndarray,
+    base_relation_class: np.ndarray,
+    base_class_counts: np.ndarray,
+    n_relations: int,
     split: int,
 ) -> None:
     train_ids = np.flatnonzero(train)
-    # Index-defined deletions are deterministic and independent of val/test labels.
     sizes = sorted(set([1, 10, 100, max(1, len(train_ids) // 100), max(1, len(train_ids) // 10)]))
     for size in sizes:
         deleted = train_ids[:size]
         retained = train.copy()
         retained[deleted] = False
 
-        updated = base_counts.copy()
-        np.add.at(updated, (relations[deleted], y[deleted]), -1)
-        scratch = statistics(relations, y, retained)
-        if not np.array_equal(updated, scratch):
-            raise AssertionError(f"Sufficient-statistic mismatch at split={split}, size={size}")
-        if not np.array_equal(projection(updated), projection(scratch)):
-            raise AssertionError(f"Prediction-map mismatch at split={split}, size={size}")
+        updated_relation_class = base_relation_class.copy()
+        updated_class_counts = base_class_counts.copy()
+        np.add.at(updated_relation_class, (relations[deleted], y[deleted]), -1)
+        np.add.at(updated_class_counts, y[deleted], -1)
+
+        scratch_relation_class, scratch_class_counts = statistics(
+            relations, y, retained, n_relations
+        )
+        if not np.array_equal(updated_relation_class, scratch_relation_class):
+            raise AssertionError(f"Relation statistic mismatch: split={split}, size={size}")
+        if not np.array_equal(updated_class_counts, scratch_class_counts):
+            raise AssertionError(f"Prior statistic mismatch: split={split}, size={size}")
+        if not np.array_equal(
+            projection(updated_relation_class, updated_class_counts),
+            projection(scratch_relation_class, scratch_class_counts),
+        ):
+            raise AssertionError(f"Projection mismatch: split={split}, size={size}")
         emit(method="ExactUnlearningCheck", split=split, deleted=size, exact=True)
 
 
@@ -161,36 +182,38 @@ def main() -> None:
     total_start = time.perf_counter()
     text = source_text()
     y, train_masks, val_masks, test_masks, npz_path = benchmark()
-    relations, words, parse_seconds = parse_relations(text, len(y))
+    relations, words, vocabulary, parse_seconds = parse_relations(text, len(y))
+    n_relations = len(vocabulary)
 
     protocol_hash = hashlib.sha256()
     protocol_hash.update(npz_path.read_bytes())
     protocol_hash.update(MODEL.encode())
     protocol_hash.update(MODEL_VERSION.encode())
     protocol_hash.update(str(ALPHA).encode())
+    protocol_hash.update("\n".join(vocabulary).encode())
     emit(
-        method="Protocol",
+        method="AnonymousProtocol",
         protocol_sha256=protocol_hash.hexdigest(),
         nodes=len(y),
         splits=train_masks.shape[1],
         model=MODEL,
         model_version=MODEL_VERSION,
         alpha=ALPHA,
+        anonymous_relation_count=n_relations,
         parse_seconds=parse_seconds,
     )
 
     tests: list[float] = []
     vals: list[float] = []
     fit_times: list[float] = []
-    mappings: list[list[int]] = []
     for split in range(train_masks.shape[1]):
         train = train_masks[:, split]
         val = val_masks[:, split]
         test = test_masks[:, split]
 
         fit_start = time.perf_counter()
-        counts = statistics(relations, y, train)
-        mapping = projection(counts)
+        relation_class, class_counts = statistics(relations, y, train, n_relations)
+        mapping = projection(relation_class, class_counts)
         predictions = mapping[relations]
         fit_seconds = time.perf_counter() - fit_start
 
@@ -199,17 +222,23 @@ def main() -> None:
         vals.append(val_accuracy)
         tests.append(test_accuracy)
         fit_times.append(fit_seconds)
-        mappings.append(mapping.tolist())
 
-        # Verify exact unlearning on every official split before reporting it.
-        exact_unlearning_checks(relations, y, train, counts, split)
+        exact_unlearning_checks(
+            relations,
+            y,
+            train,
+            relation_class,
+            class_counts,
+            n_relations,
+            split,
+        )
         emit(
-            method="FSP",
+            method="AnonymousFSP",
             split=split,
             val=val_accuracy,
             test=test_accuracy,
             fit_seconds=fit_seconds,
-            mapping=mapping.tolist(),
+            seen_relations=int(np.count_nonzero(relation_class.sum(axis=1))),
             beats_lcf=bool(test_accuracy > LCF_TARGET),
             beats_deep_sage=bool(test_accuracy > DEEP_SAGE_TARGET),
             beats_deep_gcn=bool(test_accuracy > DEEP_GCN_TARGET),
@@ -217,7 +246,7 @@ def main() -> None:
 
     scores = np.asarray(tests)
     summary = {
-        "method": "FSP_10_SPLIT_LOCKED",
+        "method": "ANONYMOUS_FSP_10_SPLIT_LOCKED",
         "mean": float(scores.mean()),
         "std": float(scores.std(ddof=1)),
         "minimum": float(scores.min()),
@@ -226,6 +255,7 @@ def main() -> None:
         "mean_fit_seconds": float(np.mean(fit_times)),
         "parse_seconds": parse_seconds,
         "total_seconds": time.perf_counter() - total_start,
+        "anonymous_relation_count": n_relations,
         "lcf": LCF_TARGET,
         "deep_sage": DEEP_SAGE_TARGET,
         "deep_gcn": DEEP_GCN_TARGET,
@@ -234,6 +264,7 @@ def main() -> None:
         "gain_over_deep_gcn": float(scores.mean() - DEEP_GCN_TARGET),
         "all_splits_above_deep_gcn": bool(np.all(scores > DEEP_GCN_TARGET)),
         "all_unlearning_checks_exact": True,
+        "hardcoded_generator_label_dictionary": False,
     }
     (OUT / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     emit(**summary)
