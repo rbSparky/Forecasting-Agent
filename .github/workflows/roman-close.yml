@@ -43,10 +43,10 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: roman-fsp-strict-evidence
+          name: roman-fsp-anonymous-evidence
           path: |
             roman_close/strict_fsp.log
-            roman_close/strict_out/**
+            roman_close/anonymous_out/**
             roman_close/strict_fsp.py
           if-no-files-found: error
           retention-days: 30
