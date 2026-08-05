@@ -1,0 +1,46 @@
+name: Roman closed-form reconstruction
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'experiments/roman_closed_form/**'
+      - '.github/workflows/roman-closed-form-reconstruction.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  reconstruct:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install frozen parser stack
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip wheel
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu 'torch>=2.2,<3'
+          python -m pip install 'numpy<2' requests 'spacy>=3.8,<3.9' 'spacy-transformers>=1.4,<1.5'
+          python -m pip install 'https://github.com/explosion/spacy-models/releases/download/en_core_web_hftrf-3.8.1/en_core_web_hftrf-3.8.1-py3-none-any.whl'
+      - name: Reconstruct and evaluate all official splits
+        working-directory: experiments/roman_closed_form
+        shell: bash
+        run: |
+          set -o pipefail
+          python roman_source_projection.py | tee roman_source_projection.log
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: roman-closed-form-reconstruction
+          path: |
+            experiments/roman_closed_form/roman_source_projection.log
+            experiments/roman_closed_form/out/**
+          if-no-files-found: warn
+          retention-days: 14
