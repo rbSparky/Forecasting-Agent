@@ -7,6 +7,12 @@ on:
     paths:
       - 'roman_close/**'
       - '.github/workflows/roman-close.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'roman_close/**'
+      - '.github/workflows/roman-close.yml'
 
 permissions:
   contents: read
