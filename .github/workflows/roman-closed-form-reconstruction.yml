@@ -13,24 +13,37 @@ permissions:
 jobs:
   reconstruct:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
+    env:
+      ROMAN_SPACY_MODEL: en_core_web_trf
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.10'
           cache: 'pip'
-      - name: Install frozen parser stack
+      - name: Install exact 2022 parser stack
         shell: bash
         run: |
           set -euxo pipefail
-          python -m pip install --upgrade pip wheel
-          python -m pip install --index-url https://download.pytorch.org/whl/cpu 'torch==2.5.1+cpu'
-          python -m pip install 'numpy<2' requests click 'spacy>=3.8,<3.9' 'spacy-transformers>=1.4,<1.5'
-          python -m pip install 'https://github.com/explosion/spacy-models/releases/download/en_core_web_hftrf-3.8.1/en_core_web_hftrf-3.8.1-py3-none-any.whl'
+          python -m pip install --upgrade 'pip<25' wheel
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu 'torch==2.0.1+cpu'
+          python -m pip install \
+            'numpy==1.24.4' \
+            'requests<3' \
+            'click<8.2' \
+            'pydantic<2' \
+            'spacy==3.6.1' \
+            'spacy-transformers==1.2.5' \
+            'transformers==4.30.2'
+          python -m pip install 'https://github.com/explosion/spacy-models/releases/download/en_core_web_trf-3.6.1/en_core_web_trf-3.6.1-py3-none-any.whl'
           python - <<'PY'
           import importlib.metadata, torch, spacy
-          print('torch', torch.__version__, 'click', importlib.metadata.version('click'), 'spacy', spacy.__version__)
+          print('torch', torch.__version__)
+          print('spacy', spacy.__version__)
+          print('spacy-transformers', importlib.metadata.version('spacy-transformers'))
+          print('transformers', importlib.metadata.version('transformers'))
+          print('model', importlib.metadata.version('en-core-web-trf'))
           PY
       - name: Reconstruct and evaluate all official splits
         working-directory: experiments/roman_closed_form
