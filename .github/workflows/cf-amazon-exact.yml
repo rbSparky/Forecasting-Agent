@@ -17,9 +17,13 @@ permissions:
   contents: read
 
 jobs:
-  amazon-split0:
+  amazon:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        split: [0, 1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -27,16 +31,16 @@ jobs:
           python-version: '3.11'
       - name: Install dependencies
         run: python -m pip install --upgrade pip numpy scipy scikit-learn
-      - name: Run exact LCF and ordinal heads on official split 0
+      - name: Run exact LCF and ordinal heads
         env:
           OPENBLAS_NUM_THREADS: '2'
           OMP_NUM_THREADS: '2'
           MKL_NUM_THREADS: '2'
           PYTHONUNBUFFERED: '1'
-        run: python cf_closure/amazon_exact_lcf.py --split 0 --tau 0.5 --depth 9 --ridge-alpha 2 --sigma 2 --kernel-lambda 0.01
+        run: python cf_closure/amazon_exact_lcf.py --split ${{ matrix.split }} --tau 0.5 --depth 9 --ridge-alpha 2 --sigma 2 --kernel-lambda 0.01
       - name: Upload Amazon results
         uses: actions/upload-artifact@v4
         with:
-          name: cf-amazon-exact-split0
+          name: cf-amazon-exact-split${{ matrix.split }}
           compression-level: 0
           path: cf_closure/_results/amazon_exact/
