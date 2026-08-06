@@ -1,0 +1,45 @@
+name: CF Arxiv Temporal
+
+on:
+  push:
+    branches: [cf-closure-lab-20260806]
+    paths:
+      - 'cf_closure/arxiv_temporal_relational_cf.py'
+      - '.github/workflows/cf-arxiv-temporal.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'cf_closure/arxiv_temporal_relational_cf.py'
+      - '.github/workflows/cf-arxiv-temporal.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  temporal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip numpy scipy scikit-learn ogb
+      - name: Run temporal-relational closed-form experiment
+        env:
+          PYTHONUNBUFFERED: '1'
+          OMP_NUM_THREADS: '4'
+          OPENBLAS_NUM_THREADS: '4'
+          MKL_NUM_THREADS: '4'
+        run: python cf_closure/arxiv_temporal_relational_cf.py
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cf-arxiv-temporal-results
+          compression-level: 1
+          path: |
+            cf_closure/_results/arxiv_temporal_relational_cf.json
+            cf_closure/_results/arxiv_temporal_relational_scores.npy
