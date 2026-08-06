@@ -1,0 +1,44 @@
+name: CF Closure Lab
+
+on:
+  push:
+    branches: [cf-closure-lab-20260806]
+    paths:
+      - 'cf_closure/**'
+      - '.github/workflows/cf-closure-lab.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'cf_closure/**'
+      - '.github/workflows/cf-closure-lab.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-small:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip numpy
+      - name: Inspect official small benchmark files
+        run: python cf_closure/inspect_small.py
+      - name: Upload inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: cf-inspect-small
+          path: cf_closure/_results/inspect_small.json
+      - name: Upload official small datasets
+        uses: actions/upload-artifact@v4
+        with:
+          name: cf-small-data
+          compression-level: 0
+          path: |
+            cf_closure/_data/tolokers.npz
+            cf_closure/_data/amazon_ratings.npz
