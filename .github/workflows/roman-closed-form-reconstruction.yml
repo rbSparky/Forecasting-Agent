@@ -51,6 +51,7 @@ jobs:
         run: |
           set -o pipefail
           python roman_source_projection.py | tee roman_source_projection.log
+          python roman_head_diagnostic.py | tee roman_head_diagnostic.log
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -58,6 +59,7 @@ jobs:
           name: roman-closed-form-reconstruction
           path: |
             experiments/roman_closed_form/roman_source_projection.log
+            experiments/roman_closed_form/roman_head_diagnostic.log
             experiments/roman_closed_form/out/**
           if-no-files-found: warn
           retention-days: 14
