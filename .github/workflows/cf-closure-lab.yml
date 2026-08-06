@@ -34,3 +34,11 @@ jobs:
         with:
           name: cf-inspect-small
           path: cf_closure/_results/inspect_small.json
+      - name: Upload official small datasets
+        uses: actions/upload-artifact@v4
+        with:
+          name: cf-small-data
+          compression-level: 0
+          path: |
+            cf_closure/_data/tolokers.npz
+            cf_closure/_data/amazon_ratings.npz
