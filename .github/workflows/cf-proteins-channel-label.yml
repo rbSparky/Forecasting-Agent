@@ -1,0 +1,53 @@
+name: CF Proteins Channel Label
+
+on:
+  push:
+    branches: [cf-closure-lab-20260806]
+    paths:
+      - 'cf_closure/proteins_channel_label_cf_v2.py'
+      - '.github/workflows/cf-proteins-channel-label.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'cf_closure/proteins_channel_label_cf_v2.py'
+      - '.github/workflows/cf-proteins-channel-label.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  solve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip numpy scipy scikit-learn ogb
+      - name: Download prior typed structural score
+        uses: actions/download-artifact@v4
+        with:
+          name: cf-proteins-typed-results
+          path: cf_closure/_prior
+          github-token: ${{ github.token }}
+          run-id: 31091497367
+      - name: Run true-channel label solver
+        env:
+          PYTHONUNBUFFERED: '1'
+          OMP_NUM_THREADS: '4'
+          OPENBLAS_NUM_THREADS: '4'
+          MKL_NUM_THREADS: '4'
+        run: python cf_closure/proteins_channel_label_cf_v2.py
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cf-proteins-channel-label-results
+          compression-level: 1
+          path: |
+            cf_closure/_results/proteins_channel_label_cf_v2.json
+            cf_closure/_results/proteins_channel_label_scores_v2.npy
